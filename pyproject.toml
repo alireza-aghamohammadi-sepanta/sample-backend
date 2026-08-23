@@ -9,6 +9,7 @@ dependencies = [
     "cloud-sql-python-connector[pg8000]>=1.22.0",
     "fastapi[standard]>=0.141.1",
     "google-cloud-secret-manager>=2.30.0",
+    "google-cloud-storage>=3.13.1",
     "passlib[argon2]>=1.7.4",
     "pyjwt>=2.13.0",
     "sqlalchemy>=2.0.52",
