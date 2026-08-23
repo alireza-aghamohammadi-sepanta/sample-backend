@@ -1,20 +1,31 @@
-"""Integration tests for the signed URL endpoint.
+"""Integration tests for the signed URL and upload confirmation endpoints.
 
 The storage service is replaced through ``dependency_overrides`` by one built
 on a fake Cloud Storage client, so the suite never authenticates against GCP
-and never reaches the network. Nothing here touches the database either: the
-endpoint trusts the ``sub`` claim of the token, so every scenario runs without
-a service.
+and never reaches the network. The signed URL scenarios do not touch the
+database at all: the endpoint trusts the ``sub`` claim of the token.
+
+The confirmation scenarios do write rows, so ``get_db`` is overridden with a
+session on a throwaway in-memory SQLite database created from the model
+metadata. Every column of ``Asset`` uses a portable type, so the same mapping
+runs there as on PostgreSQL and the tests can assert that a record is really
+created without any service being installed.
 """
 
 import uuid
 from datetime import timedelta
 
 import pytest
+import sqlalchemy as sa
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
 from app.core.config import get_settings
 from app.core.security import create_access_token
+from app.db import Base
+from app.db.session import get_db
+from app.models import Asset, User
 from app.services.storage import StorageService, get_storage_service
 from main import app
 
@@ -33,6 +44,8 @@ BUCKET = "sample-media"
 
 SIGNED_URL_PATH = "/assets/signed-url"
 
+CONFIRM_PATH = "/assets/confirm"
+
 
 class FakeBlob:
     """Stand-in for google.cloud.storage.blob.Blob."""
@@ -40,10 +53,16 @@ class FakeBlob:
     def __init__(self, name: str):
         self.name = name
         self.signed_url_calls: list[dict] = []
+        # A blob object exists client side as soon as it is named; only an
+        # upload makes the object itself exist in the bucket.
+        self.uploaded = False
 
     def generate_signed_url(self, **kwargs):
         self.signed_url_calls.append(kwargs)
         return f"https://signed.example/{self.name}"
+
+    def exists(self) -> bool:
+        return self.uploaded
 
 
 class FakeBucket:
@@ -65,6 +84,10 @@ class FakeStorageClient:
 
     def bucket(self, name: str) -> FakeBucket:
         return self.buckets.setdefault(name, FakeBucket(name))
+
+    def upload(self, gcs_path: str, bucket_name: str = BUCKET) -> None:
+        """Pretend a client finished PUTting a file to ``gcs_path``."""
+        self.bucket(bucket_name).blob(gcs_path).uploaded = True
 
 
 @pytest.fixture(autouse=True)
@@ -97,8 +120,61 @@ def client(storage_client):
 
 
 @pytest.fixture
+def db_session():
+    """A session on a throwaway database holding the whole model schema."""
+    engine = sa.create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    try:
+        with Session(engine) as session:
+            yield session
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture
 def user_id() -> uuid.UUID:
     return uuid.uuid4()
+
+
+@pytest.fixture
+def registered_user(db_session, user_id) -> uuid.UUID:
+    """The owner the confirmation scenarios authenticate as, as a stored row."""
+    db_session.add(
+        User(
+            id=user_id,
+            email=f"{user_id}@example.test",
+            hashed_password="not-a-real-hash",
+        )
+    )
+    db_session.commit()
+    return user_id
+
+
+@pytest.fixture
+def confirm_client(storage_client, db_session):
+    """A client whose storage *and* database dependencies are local doubles."""
+    service = StorageService(bucket_name=BUCKET, client=storage_client)
+
+    def override_db():
+        yield db_session
+
+    app.dependency_overrides[get_storage_service] = lambda: service
+    app.dependency_overrides[get_db] = override_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_storage_service, None)
+        app.dependency_overrides.pop(get_db, None)
+
+
+def stored_assets(session) -> list[Asset]:
+    """Every asset row currently in ``session``'s database."""
+    session.expire_all()
+    return list(session.scalars(sa.select(Asset)))
 
 
 def auth_headers(subject) -> dict:
@@ -317,3 +393,165 @@ def test_validation_is_only_reached_with_a_token(client):
     response = client.post(SIGNED_URL_PATH, json={"media_type": "audio"})
 
     assert response.status_code == 401
+
+
+# --- R2 AC-2: the object must exist in the bucket ---------------------------
+
+# Mirrors the messages the confirmation endpoint answers with; asserting them
+# keeps a scenario from passing on FastAPI's own "Not Found" for a missing
+# route.
+NOT_FOUND_DETAIL = "Uploaded file not found"
+FORBIDDEN_DETAIL = "gcs_path is not an upload path of the authenticated user"
+
+
+def object_path(owner, media_type: str = "image", extension: str = "png") -> str:
+    """An object key of the shape the signed URL endpoint hands out."""
+    return f"users/{owner}/{media_type}/{uuid.uuid4()}.{extension}"
+
+
+def test_confirm_route_is_registered():
+    paths = app.openapi()["paths"]
+
+    assert CONFIRM_PATH in paths
+    assert "post" in paths[CONFIRM_PATH]
+
+
+def test_confirm_upload_non_existent(confirm_client, registered_user, db_session):
+    gcs_path = object_path(registered_user)
+
+    response = confirm_client.post(
+        CONFIRM_PATH,
+        json={"gcs_path": gcs_path},
+        headers=auth_headers(registered_user),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == NOT_FOUND_DETAIL
+    assert stored_assets(db_session) == []
+
+
+# --- R2 AC-3: the object must belong to the caller --------------------------
+
+
+def test_confirm_upload_unauthorized_path(
+    confirm_client, storage_client, registered_user, db_session
+):
+    other_user_id = uuid.uuid4()
+    gcs_path = object_path(other_user_id)
+    # The victim's file is really there: only the ownership check may stop it
+    # from being claimed.
+    storage_client.upload(gcs_path)
+
+    response = confirm_client.post(
+        CONFIRM_PATH,
+        json={"gcs_path": gcs_path},
+        headers=auth_headers(registered_user),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == FORBIDDEN_DETAIL
+    assert stored_assets(db_session) == []
+
+
+@pytest.mark.parametrize(
+    "template",
+    (
+        "{owner}/image/name.png",  # no ``users`` prefix
+        "users/{owner}/image",  # no file name
+        "users/{owner}//name.png",  # no media type
+        "users/{owner}/image/nested/name.png",  # deeper than one file
+        "users/{owner}/audio/name.mp3",  # media type the product never issues
+        "users/../{owner}/image/name.png",  # traversal
+    ),
+)
+def test_confirm_upload_rejects_a_path_that_is_not_an_upload_key(
+    confirm_client, storage_client, registered_user, db_session, template
+):
+    gcs_path = template.format(owner=registered_user)
+    storage_client.upload(gcs_path)
+
+    response = confirm_client.post(
+        CONFIRM_PATH,
+        json={"gcs_path": gcs_path},
+        headers=auth_headers(registered_user),
+    )
+
+    assert response.status_code == 403
+    assert stored_assets(db_session) == []
+
+
+def test_confirm_upload_unauthorized(confirm_client, storage_client, db_session):
+    gcs_path = object_path(uuid.uuid4())
+    storage_client.upload(gcs_path)
+
+    response = confirm_client.post(CONFIRM_PATH, json={"gcs_path": gcs_path})
+
+    assert response.status_code == 401
+    assert stored_assets(db_session) == []
+
+
+# --- R2 AC-1: the confirmed upload is stored --------------------------------
+
+
+def test_confirm_upload_success(
+    confirm_client, storage_client, registered_user, db_session
+):
+    gcs_path = object_path(registered_user, media_type="video", extension="webm")
+    storage_client.upload(gcs_path)
+
+    response = confirm_client.post(
+        CONFIRM_PATH,
+        json={"gcs_path": gcs_path},
+        headers=auth_headers(registered_user),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {
+        "id",
+        "user_id",
+        "gcs_path",
+        "public_url",
+        "media_type",
+        "created_at",
+    }
+    assert body["user_id"] == str(registered_user)
+    assert body["gcs_path"] == gcs_path
+    assert body["public_url"] == f"https://storage.googleapis.com/{BUCKET}/{gcs_path}"
+    assert body["media_type"] == "video"
+
+    (asset,) = stored_assets(db_session)
+    assert asset.id == uuid.UUID(body["id"])
+    assert asset.user_id == registered_user
+    assert asset.gcs_path == gcs_path
+    assert asset.public_url == body["public_url"]
+    assert asset.media_type == "video"
+    assert asset.created_at is not None
+
+
+def test_signed_url_then_confirm_stores_the_upload(
+    confirm_client, storage_client, registered_user, db_session
+):
+    headers = auth_headers(registered_user)
+    gcs_path = confirm_client.post(
+        SIGNED_URL_PATH,
+        json={"media_type": "image", "file_extension": "png"},
+        headers=headers,
+    ).json()["gcs_path"]
+    storage_client.upload(gcs_path)
+
+    response = confirm_client.post(
+        CONFIRM_PATH, json={"gcs_path": gcs_path}, headers=headers
+    )
+
+    assert response.status_code == 200
+    (asset,) = stored_assets(db_session)
+    assert (asset.gcs_path, asset.media_type) == (gcs_path, "image")
+
+
+def test_confirm_upload_requires_a_gcs_path(confirm_client, registered_user):
+    response = confirm_client.post(
+        CONFIRM_PATH, json={}, headers=auth_headers(registered_user)
+    )
+
+    assert response.status_code == 422
