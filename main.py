@@ -1,10 +1,11 @@
 from fastapi import FastAPI
 
-from app.api import auth
+from app.api import assets, auth
 
 app = FastAPI()
 
 app.include_router(auth.router)
+app.include_router(assets.router)
 
 @app.get("/")
 async def root():

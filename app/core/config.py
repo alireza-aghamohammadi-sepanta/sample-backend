@@ -14,6 +14,8 @@ DATABASE_INSTANCE_ENV = "DATABASE_INSTANCE"
 GCP_PROJECT_ID_ENV = "GCP_PROJECT_ID"
 JWT_SECRET_NAME_ENV = "JWT_SECRET_NAME"
 DATABASE_INSTANCE_SECRET_NAME_ENV = "DATABASE_INSTANCE_SECRET_NAME"
+GCS_BUCKET_NAME_ENV = "GCS_BUCKET_NAME"
+GCS_SERVICE_ACCOUNT_INFO_ENV = "GCS_SERVICE_ACCOUNT_INFO"
 
 
 class ConfigError(RuntimeError):
@@ -27,6 +29,8 @@ class Settings:
     jwt_secret: str
     database_instance: str
     gcp_project_id: str | None = None
+    gcs_bucket_name: str | None = None
+    gcs_service_account_info: str | None = None
 
 
 def _build_secret_manager_client():
@@ -94,10 +98,18 @@ def load_settings() -> Settings:
         client_factory,
     )
 
+    # Optional: only needed by the features that talk to Cloud Storage.
+    # GCS_SERVICE_ACCOUNT_INFO holds a service account key as JSON and is used
+    # to sign URLs locally; on GCP the attached service account signs instead.
+    gcs_bucket_name = os.environ.get(GCS_BUCKET_NAME_ENV) or None
+    gcs_service_account_info = os.environ.get(GCS_SERVICE_ACCOUNT_INFO_ENV) or None
+
     return Settings(
         jwt_secret=jwt_secret,
         database_instance=database_instance,
         gcp_project_id=project_id,
+        gcs_bucket_name=gcs_bucket_name,
+        gcs_service_account_info=gcs_service_account_info,
     )
 
 

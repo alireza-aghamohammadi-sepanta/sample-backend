@@ -7,9 +7,12 @@ module import machinery.
 """
 
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import jwt
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
 
 from app.core.config import get_settings
@@ -18,6 +21,13 @@ ALGORITHM = "HS256"
 
 ACCESS_TOKEN_EXPIRE_MINUTES_ENV = "ACCESS_TOKEN_EXPIRE_MINUTES"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+INVALID_CREDENTIALS_DETAIL = "Could not validate credentials"
+
+# ``auto_error=False`` so a missing header reaches the dependency and is
+# answered with the same 401 as a bad one: whether a token was sent at all is
+# not something an unauthenticated caller needs to learn.
+bearer_scheme = HTTPBearer(auto_error=False)
 
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
@@ -69,3 +79,40 @@ def decode_access_token(token: str) -> dict:
     expired.
     """
     return jwt.decode(token, get_settings().jwt_secret, algorithms=[ALGORITHM])
+
+
+def _unauthorized() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=INVALID_CREDENTIALS_DETAIL,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> uuid.UUID:
+    """Return the id of the user the bearer token was issued to.
+
+    Every failure mode - no header, a token this service did not sign, an
+    expired token, a subject that is not a user id - is answered with the same
+    401 and the same message, so nothing about the token is disclosed. The
+    subject is parsed as a UUID before it is handed to callers: it ends up in
+    Cloud Storage object keys, and only a real user id may go there.
+    """
+    if credentials is None or not credentials.credentials:
+        raise _unauthorized()
+
+    try:
+        payload = decode_access_token(credentials.credentials)
+    except jwt.PyJWTError:
+        raise _unauthorized() from None
+
+    subject = payload.get("sub")
+    if not subject:
+        raise _unauthorized()
+
+    try:
+        return uuid.UUID(str(subject))
+    except ValueError:
+        raise _unauthorized() from None
