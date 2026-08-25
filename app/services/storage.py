@@ -7,16 +7,18 @@ rejects anything larger than :data:`MAX_UPLOAD_BYTES`, and a client cannot lift
 the limit without invalidating the signature.
 
 The service takes its bucket and its storage client as constructor arguments,
-so it can be built with doubles. The client behind :func:`get_storage_service`
-is only created on first use, which keeps this module importable (and the test
-suite runnable) without GCP credentials.
+so it can be built with doubles. One service - and one client - is built per
+application by the lifespan, and :func:`get_storage_service` hands requests
+that very instance, which keeps this module importable (and the test suite
+runnable) without GCP credentials.
 """
 
 import json
 import uuid
 from datetime import timedelta
-from functools import lru_cache
 from typing import Any
+
+from fastapi import HTTPException, Request, status
 
 from app.core.config import ConfigError, get_settings
 from app.schemas.asset import MediaType
@@ -39,6 +41,10 @@ PUBLIC_URL_TEMPLATE = "https://storage.googleapis.com/{bucket}/{path}"
 OBJECT_PATH_TEMPLATE = "users/{user_id}/{media_type}/{name}.{extension}"
 OBJECT_PATH_PREFIX = "users"
 OBJECT_PATH_SEGMENTS = 4
+
+# Answered when an application serves a request without a storage service; the
+# deployment, not the caller, is what has to be fixed.
+STORAGE_UNAVAILABLE_DETAIL = "Cloud Storage is not available"
 
 
 def _build_storage_client() -> Any:
@@ -161,7 +167,18 @@ def build_storage_service() -> StorageService:
     )
 
 
-@lru_cache(maxsize=1)
-def get_storage_service() -> StorageService:
-    """Return the process wide storage service, built on first use."""
-    return build_storage_service()
+def get_storage_service(request: Request) -> StorageService:
+    """FastAPI dependency returning the storage service of the application.
+
+    The service is the one the lifespan published on ``app.state``. When there
+    is none - no bucket configured, no credentials to sign with - the request
+    fails with a clear server error instead of a fresh client being built,
+    unnoticed, for every single call.
+    """
+    service = getattr(request.app.state, "storage_service", None)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=STORAGE_UNAVAILABLE_DETAIL,
+        )
+    return service

@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from app.core.config import get_settings
 from app.db.session import DatabaseManager
 from app.services import storage as storage_module
-from app.services.storage import StorageService, get_storage_service
+from app.services.storage import StorageService
 from main import app
 
 client = TestClient(app)
@@ -43,10 +43,8 @@ def clean_env(monkeypatch):
     for name in ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     get_settings.cache_clear()
-    get_storage_service.cache_clear()
     yield
     get_settings.cache_clear()
-    get_storage_service.cache_clear()
 
 
 @pytest.fixture

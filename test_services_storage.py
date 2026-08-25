@@ -1,13 +1,17 @@
-"""Unit tests for the Cloud Storage service.
+"""Unit tests for the Cloud Storage service and its dependency provider.
 
 The GCS client is replaced by fakes, so the suite never authenticates and
-never reaches the network.
+never reaches the network. The provider is exercised against requests carrying
+a hand made application state, which is what the lifespan fills in production.
 """
 
 import uuid
 from datetime import timedelta
 
 import pytest
+from fastapi import HTTPException
+from starlette.datastructures import State
+from starlette.requests import Request
 
 from app.core.config import ConfigError, get_settings
 from app.schemas.asset import MediaType
@@ -16,6 +20,7 @@ from app.services.storage import (
     CONTENT_LENGTH_RANGE_HEADER,
     MAX_UPLOAD_BYTES,
     StorageService,
+    build_storage_service,
     get_storage_service,
 )
 
@@ -75,16 +80,26 @@ class FakeStorageClient:
         return self.buckets.setdefault(name, FakeBucket(name))
 
 
+class FakeApp:
+    """Stand-in for the ASGI application: only its state matters here."""
+
+    def __init__(self, **state):
+        self.state = State(state)
+
+
+def request_with_state(**state) -> Request:
+    """A request served by an application whose state holds ``state``."""
+    return Request({"type": "http", "app": FakeApp(**state)})
+
+
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     for name in ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     FakeStorageClient.instances = []
     get_settings.cache_clear()
-    get_storage_service.cache_clear()
     yield
     get_settings.cache_clear()
-    get_storage_service.cache_clear()
 
 
 @pytest.fixture
@@ -243,24 +258,45 @@ def test_the_service_uses_the_injected_bucket_and_client(client):
     assert service.client is client
 
 
-def test_get_storage_service_takes_the_bucket_name_from_the_settings(
+def test_build_storage_service_takes_the_bucket_name_from_the_settings(
     monkeypatch, configured
 ):
     monkeypatch.setenv("GCS_BUCKET_NAME", "from-settings")
 
-    assert get_storage_service().bucket_name == "from-settings"
+    assert build_storage_service().bucket_name == "from-settings"
 
 
-def test_get_storage_service_without_a_bucket_name_is_a_config_error(configured):
+def test_build_storage_service_without_a_bucket_name_is_a_config_error(configured):
     with pytest.raises(ConfigError):
-        get_storage_service()
+        build_storage_service()
 
 
-def test_get_storage_service_is_cached(monkeypatch, configured):
-    monkeypatch.setenv("GCS_BUCKET_NAME", BUCKET)
+def test_get_storage_service_returns_the_service_of_the_application(service):
+    request = request_with_state(storage_service=service)
 
-    service = get_storage_service()
-
-    assert get_storage_service() is service
-    # The Cloud Storage client is built once, by the first call.
+    assert get_storage_service(request) is service
+    # The service of the application is handed out as it is: no second client.
     assert FakeStorageClient.instances == [service.client]
+
+
+def test_get_storage_service_without_a_configured_service_fails_loudly(
+    monkeypatch, configured
+):
+    monkeypatch.setenv("GCS_BUCKET_NAME", BUCKET)
+    request = request_with_state(storage_service=None)
+
+    with pytest.raises(HTTPException) as excinfo:
+        get_storage_service(request)
+
+    assert excinfo.value.status_code == 500
+    assert excinfo.value.detail == storage_module.STORAGE_UNAVAILABLE_DETAIL
+    # Even perfectly configured, the provider never builds a client of its own.
+    assert FakeStorageClient.instances == []
+
+
+def test_get_storage_service_without_any_state_fails_loudly(configured):
+    with pytest.raises(HTTPException) as excinfo:
+        get_storage_service(request_with_state())
+
+    assert excinfo.value.status_code == 500
+    assert FakeStorageClient.instances == []

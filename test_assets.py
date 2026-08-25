@@ -10,6 +10,10 @@ session on a throwaway in-memory SQLite database created from the model
 metadata. Every column of ``Asset`` uses a portable type, so the same mapping
 runs there as on PostgreSQL and the tests can assert that a record is really
 created without any service being installed.
+
+A last group overrides nothing and publishes the storage service on
+``app.state`` instead, which is how the lifespan wires it: those scenarios
+cover the provider itself.
 """
 
 import uuid
@@ -26,7 +30,11 @@ from app.core.security import create_access_token
 from app.db import Base
 from app.db.session import get_db
 from app.models import Asset, User
-from app.services.storage import StorageService, get_storage_service
+from app.services.storage import (
+    STORAGE_UNAVAILABLE_DETAIL,
+    StorageService,
+    get_storage_service,
+)
 from main import app
 
 ENV_VARS = (
@@ -90,6 +98,24 @@ class FakeStorageClient:
         self.bucket(bucket_name).blob(gcs_path).uploaded = True
 
 
+class RecordingStorageService(StorageService):
+    """A storage service recording the ownership checks the API asks it for.
+
+    ``get_owned_media_type`` answers whatever the test asked for, so a scenario
+    can prove the endpoint takes the verdict of the service instead of reading
+    the key itself.
+    """
+
+    def __init__(self, bucket_name: str, client, media_type: str | None = "image"):
+        super().__init__(bucket_name=bucket_name, client=client)
+        self.media_type = media_type
+        self.owned_media_type_calls: list[tuple[str, uuid.UUID]] = []
+
+    def get_owned_media_type(self, gcs_path, user_id):
+        self.owned_media_type_calls.append((gcs_path, user_id))
+        return self.media_type
+
+
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     for name in ENV_VARS:
@@ -97,10 +123,8 @@ def clean_env(monkeypatch):
     monkeypatch.setenv("JWT_SECRET", SECRET)
     monkeypatch.setenv("DATABASE_INSTANCE", "project:region:instance")
     get_settings.cache_clear()
-    get_storage_service.cache_clear()
     yield
     get_settings.cache_clear()
-    get_storage_service.cache_clear()
 
 
 @pytest.fixture
@@ -169,6 +193,56 @@ def confirm_client(storage_client, db_session):
     finally:
         app.dependency_overrides.pop(get_storage_service, None)
         app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.fixture
+def recording_client(storage_client, db_session):
+    """A factory of clients whose storage service records what it is asked."""
+
+    def build(media_type: str | None = "image"):
+        service = RecordingStorageService(BUCKET, storage_client, media_type)
+
+        def override_db():
+            yield db_session
+
+        app.dependency_overrides[get_storage_service] = lambda: service
+        app.dependency_overrides[get_db] = override_db
+        return TestClient(app), service
+
+    try:
+        yield build
+    finally:
+        app.dependency_overrides.pop(get_storage_service, None)
+        app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.fixture
+def state_client(db_session):
+    """A factory of clients served by the storage service on ``app.state``.
+
+    Nothing is overridden, so the scenarios exercise the real provider: the
+    lifespan is simulated by publishing the service (or its absence) itself.
+    """
+    missing = object()
+    previous = getattr(app.state, "storage_service", missing)
+
+    def build(service: StorageService | None):
+        app.state.storage_service = service
+
+        def override_db():
+            yield db_session
+
+        app.dependency_overrides[get_db] = override_db
+        return TestClient(app, raise_server_exceptions=False)
+
+    try:
+        yield build
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        if previous is missing:
+            del app.state.storage_service
+        else:
+            app.state.storage_service = previous
 
 
 def stored_assets(session) -> list[Asset]:
@@ -555,3 +629,99 @@ def test_confirm_upload_requires_a_gcs_path(confirm_client, registered_user):
     )
 
     assert response.status_code == 422
+
+
+# --- the API layer knows no object key format -------------------------------
+
+
+def test_confirm_upload_asks_the_storage_service_who_owns_the_path(
+    recording_client, storage_client, registered_user
+):
+    client, service = recording_client()
+    gcs_path = object_path(registered_user)
+    storage_client.upload(gcs_path)
+
+    response = client.post(
+        CONFIRM_PATH,
+        json={"gcs_path": gcs_path},
+        headers=auth_headers(registered_user),
+    )
+
+    assert response.status_code == 200
+    assert service.owned_media_type_calls == [(gcs_path, registered_user)]
+
+
+def test_confirm_upload_stores_the_media_type_the_service_reports(
+    recording_client, storage_client, registered_user, db_session
+):
+    # A key of a shape the endpoint could not classify on its own: only the
+    # service decides what it is, and the endpoint stores that answer.
+    client, _service = recording_client(media_type="video")
+    gcs_path = "some/other/layout.bin"
+    storage_client.upload(gcs_path)
+
+    response = client.post(
+        CONFIRM_PATH,
+        json={"gcs_path": gcs_path},
+        headers=auth_headers(registered_user),
+    )
+
+    assert response.status_code == 200
+    (asset,) = stored_assets(db_session)
+    assert (asset.gcs_path, asset.media_type) == (gcs_path, "video")
+
+
+def test_confirm_upload_refuses_a_path_the_service_disowns(
+    recording_client, storage_client, registered_user, db_session
+):
+    # A perfectly shaped key of the caller: the endpoint still refuses it,
+    # because ownership is the service's verdict, not a string comparison.
+    client, service = recording_client(media_type=None)
+    gcs_path = object_path(registered_user)
+    storage_client.upload(gcs_path)
+
+    response = client.post(
+        CONFIRM_PATH,
+        json={"gcs_path": gcs_path},
+        headers=auth_headers(registered_user),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == FORBIDDEN_DETAIL
+    assert service.owned_media_type_calls == [(gcs_path, registered_user)]
+    assert stored_assets(db_session) == []
+
+
+# --- the endpoints are served by the application state ----------------------
+
+
+def test_endpoints_use_the_storage_service_of_the_application_state(
+    state_client, storage_client, registered_user
+):
+    client = state_client(StorageService(bucket_name=BUCKET, client=storage_client))
+
+    response = client.post(
+        SIGNED_URL_PATH,
+        json={"media_type": "image", "file_extension": "png"},
+        headers=auth_headers(registered_user),
+    )
+
+    assert response.status_code == 200
+    gcs_path = response.json()["gcs_path"]
+    assert gcs_path in storage_client.buckets[BUCKET].blobs
+
+
+def test_endpoints_fail_loudly_without_a_storage_service(
+    state_client, registered_user, db_session
+):
+    client = state_client(None)
+
+    response = client.post(
+        SIGNED_URL_PATH,
+        json={"media_type": "image", "file_extension": "png"},
+        headers=auth_headers(registered_user),
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == STORAGE_UNAVAILABLE_DETAIL
+    assert stored_assets(db_session) == []

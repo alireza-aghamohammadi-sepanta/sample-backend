@@ -11,12 +11,18 @@ of one application, so their lifecycle is explicit and several managers (a real
 one and a test one, say) can coexist. The module level entrypoints delegate to a
 default manager, which keeps importing this module free of configuration loading
 and of connection attempts.
+
+Requests are served by the manager the application published on ``app.state``
+at startup, so a session belongs to the application it is opened for; the
+default manager only serves callers that have no application at all, such as
+Alembic.
 """
 
 import os
 from collections.abc import Iterator
 from typing import Any
 
+from fastapi import Request
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -153,9 +159,20 @@ def reset_engine() -> None:
     _manager.shutdown()
 
 
-def get_db() -> Iterator[Session]:
+def manager_for_request(request: Request) -> DatabaseManager:
+    """Return the manager serving ``request``.
+
+    That is the one the lifespan published on ``app.state``; an application
+    whose lifespan never ran - a bare ``TestClient(app)``, say - falls back to
+    the default manager, so a request is never left without a database.
+    """
+    manager = getattr(request.app.state, "db_manager", None)
+    return _manager if manager is None else manager
+
+
+def get_db(request: Request) -> Iterator[Session]:
     """FastAPI dependency yielding a session that is always closed."""
-    session = _manager.create_session()
+    session = manager_for_request(request).create_session()
     try:
         yield session
     finally:

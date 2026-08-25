@@ -2,6 +2,8 @@ import os
 
 import pytest
 from sqlalchemy import text
+from starlette.datastructures import State
+from starlette.requests import Request
 
 from app.core.config import ConfigError, get_settings
 from app.db import session as db_session
@@ -43,6 +45,18 @@ class FakeConnector:
 
     def close(self):
         self.closed = True
+
+
+class FakeApp:
+    """Stand-in for the ASGI application: only its state matters here."""
+
+    def __init__(self, **state):
+        self.state = State(state)
+
+
+def request_with_state(**state) -> Request:
+    """A request served by an application whose state holds ``state``."""
+    return Request({"type": "http", "app": FakeApp(**state)})
 
 
 @pytest.fixture(autouse=True)
@@ -147,7 +161,7 @@ def test_engine_is_cached(monkeypatch):
 def test_get_db_yields_a_working_session_and_closes_it(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", LOCAL_DATABASE_URL)
 
-    generator = db_session.get_db()
+    generator = db_session.get_db(request_with_state())
     session = next(generator)
 
     assert session.execute(text("SELECT 1")).scalar_one() == 1
@@ -162,7 +176,7 @@ def test_get_db_yields_a_working_session_and_closes_it(monkeypatch):
 def test_get_db_closes_the_session_on_error(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", LOCAL_DATABASE_URL)
 
-    generator = db_session.get_db()
+    generator = db_session.get_db(request_with_state())
     session = next(generator)
     session.execute(text("SELECT 1"))
 
@@ -170,6 +184,32 @@ def test_get_db_closes_the_session_on_error(monkeypatch):
         generator.throw(RuntimeError("boom"))
 
     assert not session.in_transaction()
+
+
+def test_get_db_uses_the_manager_of_the_application(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", LOCAL_DATABASE_URL)
+    manager = db_session.DatabaseManager()
+    request = request_with_state(db_manager=manager)
+
+    generator = db_session.get_db(request)
+    session = next(generator)
+    try:
+        assert session.get_bind() is manager.get_engine()
+    finally:
+        generator.close()
+        manager.shutdown()
+
+
+def test_get_db_falls_back_to_the_default_manager(monkeypatch):
+    """Outside a started application the module level manager still serves."""
+    monkeypatch.setenv("DATABASE_URL", LOCAL_DATABASE_URL)
+
+    generator = db_session.get_db(request_with_state())
+    session = next(generator)
+    try:
+        assert session.get_bind() is db_session.get_engine()
+    finally:
+        generator.close()
 
 
 def test_manager_touches_nothing_before_it_is_used(fake_connector):

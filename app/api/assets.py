@@ -8,6 +8,10 @@ never from anything in the request body, so one user can neither write into
 another user's prefix nor claim a file uploaded there. Confirmation also checks
 that the object really is in the bucket, so no row is ever written for a file
 that was never uploaded.
+
+What an object key looks like is none of this module's business: keys are built
+and read back by the storage service, and these handlers only pass them around
+and turn a refusal into a status code.
 """
 
 import uuid
