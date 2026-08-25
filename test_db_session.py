@@ -2,6 +2,8 @@ import os
 
 import pytest
 from sqlalchemy import text
+from starlette.datastructures import State
+from starlette.requests import Request
 
 from app.core.config import ConfigError, get_settings
 from app.db import session as db_session
@@ -43,6 +45,18 @@ class FakeConnector:
 
     def close(self):
         self.closed = True
+
+
+class FakeApp:
+    """Stand-in for the ASGI application: only its state matters here."""
+
+    def __init__(self, **state):
+        self.state = State(state)
+
+
+def request_with_state(**state) -> Request:
+    """A request served by an application whose state holds ``state``."""
+    return Request({"type": "http", "app": FakeApp(**state)})
 
 
 @pytest.fixture(autouse=True)
@@ -147,7 +161,7 @@ def test_engine_is_cached(monkeypatch):
 def test_get_db_yields_a_working_session_and_closes_it(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", LOCAL_DATABASE_URL)
 
-    generator = db_session.get_db()
+    generator = db_session.get_db(request_with_state())
     session = next(generator)
 
     assert session.execute(text("SELECT 1")).scalar_one() == 1
@@ -162,7 +176,7 @@ def test_get_db_yields_a_working_session_and_closes_it(monkeypatch):
 def test_get_db_closes_the_session_on_error(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", LOCAL_DATABASE_URL)
 
-    generator = db_session.get_db()
+    generator = db_session.get_db(request_with_state())
     session = next(generator)
     session.execute(text("SELECT 1"))
 
@@ -170,3 +184,108 @@ def test_get_db_closes_the_session_on_error(monkeypatch):
         generator.throw(RuntimeError("boom"))
 
     assert not session.in_transaction()
+
+
+def test_get_db_uses_the_manager_of_the_application(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", LOCAL_DATABASE_URL)
+    manager = db_session.DatabaseManager()
+    request = request_with_state(db_manager=manager)
+
+    generator = db_session.get_db(request)
+    session = next(generator)
+    try:
+        assert session.get_bind() is manager.get_engine()
+    finally:
+        generator.close()
+        manager.shutdown()
+
+
+def test_get_db_falls_back_to_the_default_manager(monkeypatch):
+    """Outside a started application the module level manager still serves."""
+    monkeypatch.setenv("DATABASE_URL", LOCAL_DATABASE_URL)
+
+    generator = db_session.get_db(request_with_state())
+    session = next(generator)
+    try:
+        assert session.get_bind() is db_session.get_engine()
+    finally:
+        generator.close()
+
+
+def test_manager_touches_nothing_before_it_is_used(fake_connector):
+    manager = db_session.DatabaseManager()
+
+    # Neither the connector nor the engine exist before they are asked for.
+    assert fake_connector.instances == []
+    assert manager.session_factory.kw.get("bind") is None
+
+
+def test_manager_creates_a_working_session(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", LOCAL_DATABASE_URL)
+    manager = db_session.DatabaseManager()
+
+    session = manager.create_session()
+    try:
+        assert session.execute(text("SELECT 1")).scalar_one() == 1
+    finally:
+        session.close()
+
+    manager.shutdown()
+
+
+def test_manager_caches_its_engine(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", LOCAL_DATABASE_URL)
+    manager = db_session.DatabaseManager()
+
+    assert manager.get_engine() is manager.get_engine()
+
+    manager.shutdown()
+
+
+def test_manager_shutdown_disposes_the_engine(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", LOCAL_DATABASE_URL)
+    manager = db_session.DatabaseManager()
+    engine = manager.get_engine()
+    pool = engine.pool
+
+    manager.shutdown()
+
+    # Disposing an engine replaces its connection pool.
+    assert engine.pool is not pool
+    assert manager.get_engine() is not engine
+
+    manager.shutdown()
+
+
+def test_manager_shutdown_closes_the_connector(monkeypatch, fake_connector):
+    _set_cloud_sql_env(monkeypatch)
+    manager = db_session.DatabaseManager()
+    manager.connect_with_connector()
+    connector = fake_connector.instances[0]
+
+    manager.shutdown()
+
+    assert connector.closed
+    # A shut down manager forgets its connector and builds a fresh one.
+    manager.connect_with_connector()
+    assert len(fake_connector.instances) == 2
+
+
+def test_manager_shutdown_is_idempotent(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", LOCAL_DATABASE_URL)
+    manager = db_session.DatabaseManager()
+
+    manager.shutdown()
+    manager.shutdown()
+
+
+def test_managers_do_not_share_engine_or_connector(monkeypatch, fake_connector):
+    _set_cloud_sql_env(monkeypatch)
+    first = db_session.DatabaseManager()
+    second = db_session.DatabaseManager()
+
+    first.connect_with_connector()
+    second.connect_with_connector()
+
+    assert first.get_engine() is not second.get_engine()
+    assert len(fake_connector.instances) == 2

@@ -1,13 +1,17 @@
-"""Unit tests for the Cloud Storage service.
+"""Unit tests for the Cloud Storage service and its dependency provider.
 
 The GCS client is replaced by fakes, so the suite never authenticates and
-never reaches the network.
+never reaches the network. The provider is exercised against requests carrying
+a hand made application state, which is what the lifespan fills in production.
 """
 
 import uuid
 from datetime import timedelta
 
 import pytest
+from fastapi import HTTPException
+from starlette.datastructures import State
+from starlette.requests import Request
 
 from app.core.config import ConfigError, get_settings
 from app.schemas.asset import MediaType
@@ -16,6 +20,7 @@ from app.services.storage import (
     CONTENT_LENGTH_RANGE_HEADER,
     MAX_UPLOAD_BYTES,
     StorageService,
+    build_storage_service,
     get_storage_service,
 )
 
@@ -75,16 +80,26 @@ class FakeStorageClient:
         return self.buckets.setdefault(name, FakeBucket(name))
 
 
+class FakeApp:
+    """Stand-in for the ASGI application: only its state matters here."""
+
+    def __init__(self, **state):
+        self.state = State(state)
+
+
+def request_with_state(**state) -> Request:
+    """A request served by an application whose state holds ``state``."""
+    return Request({"type": "http", "app": FakeApp(**state)})
+
+
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     for name in ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     FakeStorageClient.instances = []
     get_settings.cache_clear()
-    get_storage_service.cache_clear()
     yield
     get_settings.cache_clear()
-    get_storage_service.cache_clear()
 
 
 @pytest.fixture
@@ -95,6 +110,16 @@ def client() -> FakeStorageClient:
 @pytest.fixture
 def service(client) -> StorageService:
     return StorageService(bucket_name=BUCKET, client=client)
+
+
+@pytest.fixture
+def configured(monkeypatch):
+    """Settings and a fake client factory the provider can be built from."""
+    monkeypatch.setenv("JWT_SECRET", "jwt")
+    monkeypatch.setenv("DATABASE_INSTANCE", "project:region:db")
+    monkeypatch.setattr(
+        storage_module, "_build_storage_client", lambda: FakeStorageClient()
+    )
 
 
 def test_max_upload_bytes_is_500_mb():
@@ -182,40 +207,96 @@ def test_public_url_points_at_the_bucket(service):
     )
 
 
-def test_client_is_built_lazily_and_only_once(monkeypatch):
-    monkeypatch.setenv("GCS_BUCKET_NAME", BUCKET)
-    monkeypatch.setattr(
-        storage_module, "_build_storage_client", lambda: FakeStorageClient()
-    )
+def test_get_owned_media_type_accepts_an_upload_key_of_the_owner(service):
+    user_id = uuid.uuid4()
 
-    service = StorageService()
-    assert FakeStorageClient.instances == []
+    for media_type in MediaType:
+        path = service.build_object_path(user_id, media_type, "bin")
 
-    assert service.client is service.client
-    assert len(FakeStorageClient.instances) == 1
+        assert service.get_owned_media_type(path, user_id) == media_type.value
 
 
-def test_bucket_name_falls_back_to_the_settings(monkeypatch, client):
-    monkeypatch.setenv("JWT_SECRET", "jwt")
-    monkeypatch.setenv("DATABASE_INSTANCE", "project:region:db")
+def test_get_owned_media_type_accepts_the_owner_id_as_a_string(service):
+    user_id = uuid.uuid4()
+    path = service.build_object_path(user_id, MediaType.IMAGE, "png")
+
+    assert service.get_owned_media_type(path, str(user_id)) == MediaType.IMAGE.value
+
+
+def test_get_owned_media_type_refuses_another_users_key(service):
+    owner = uuid.uuid4()
+    path = service.build_object_path(owner, MediaType.IMAGE, "png")
+
+    assert service.get_owned_media_type(path, uuid.uuid4()) is None
+
+
+@pytest.mark.parametrize(
+    "template",
+    (
+        "{owner}/image/name.png",  # no ``users`` prefix
+        "users/{owner}/image",  # no file name
+        "users/{owner}/image/",  # empty file name
+        "users/{owner}//name.png",  # no media type
+        "users/{owner}/image/nested/name.png",  # deeper than one file
+        "users/{owner}/audio/name.mp3",  # media type the product never issues
+        "users/../{owner}/image/name.png",  # traversal
+        "",  # nothing at all
+    ),
+)
+def test_get_owned_media_type_refuses_a_path_that_is_not_an_upload_key(
+    service, template
+):
+    user_id = uuid.uuid4()
+
+    assert service.get_owned_media_type(template.format(owner=user_id), user_id) is None
+
+
+def test_the_service_uses_the_injected_bucket_and_client(client):
+    service = StorageService(bucket_name=BUCKET, client=client)
+
+    assert service.bucket_name == BUCKET
+    assert service.client is client
+
+
+def test_build_storage_service_takes_the_bucket_name_from_the_settings(
+    monkeypatch, configured
+):
     monkeypatch.setenv("GCS_BUCKET_NAME", "from-settings")
 
-    service = StorageService(client=client)
-
-    assert service.bucket_name == "from-settings"
+    assert build_storage_service().bucket_name == "from-settings"
 
 
-def test_missing_bucket_name_is_a_config_error(monkeypatch, client):
-    monkeypatch.setenv("JWT_SECRET", "jwt")
-    monkeypatch.setenv("DATABASE_INSTANCE", "project:region:db")
-
-    service = StorageService(client=client)
-
+def test_build_storage_service_without_a_bucket_name_is_a_config_error(configured):
     with pytest.raises(ConfigError):
-        service.bucket_name
+        build_storage_service()
 
 
-def test_get_storage_service_is_cached(monkeypatch):
+def test_get_storage_service_returns_the_service_of_the_application(service):
+    request = request_with_state(storage_service=service)
+
+    assert get_storage_service(request) is service
+    # The service of the application is handed out as it is: no second client.
+    assert FakeStorageClient.instances == [service.client]
+
+
+def test_get_storage_service_without_a_configured_service_fails_loudly(
+    monkeypatch, configured
+):
     monkeypatch.setenv("GCS_BUCKET_NAME", BUCKET)
+    request = request_with_state(storage_service=None)
 
-    assert get_storage_service() is get_storage_service()
+    with pytest.raises(HTTPException) as excinfo:
+        get_storage_service(request)
+
+    assert excinfo.value.status_code == 500
+    assert excinfo.value.detail == storage_module.STORAGE_UNAVAILABLE_DETAIL
+    # Even perfectly configured, the provider never builds a client of its own.
+    assert FakeStorageClient.instances == []
+
+
+def test_get_storage_service_without_any_state_fails_loudly(configured):
+    with pytest.raises(HTTPException) as excinfo:
+        get_storage_service(request_with_state())
+
+    assert excinfo.value.status_code == 500
+    assert FakeStorageClient.instances == []

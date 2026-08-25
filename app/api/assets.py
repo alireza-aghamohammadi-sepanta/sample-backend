@@ -8,6 +8,10 @@ never from anything in the request body, so one user can neither write into
 another user's prefix nor claim a file uploaded there. Confirmation also checks
 that the object really is in the bucket, so no row is ever written for a file
 that was never uploaded.
+
+What an object key looks like is none of this module's business: keys are built
+and read back by the storage service, and these handlers only pass them around
+and turn a refusal into a status code.
 """
 
 import uuid
@@ -21,7 +25,6 @@ from app.models.asset import Asset
 from app.schemas.asset import (
     AssetConfirmRequest,
     AssetResponse,
-    MediaType,
     SignedURLRequest,
     SignedURLResponse,
 )
@@ -34,32 +37,6 @@ router = APIRouter(prefix="/assets", tags=["assets"])
 # needs to learn.
 FORBIDDEN_PATH_DETAIL = "gcs_path is not an upload path of the authenticated user"
 FILE_NOT_FOUND_DETAIL = "Uploaded file not found"
-
-# ``users/{user_id}/{media_type}/{name}.{extension}``, the shape
-# ``StorageService.build_object_path`` hands out.
-OBJECT_PATH_PREFIX = "users"
-OBJECT_PATH_SEGMENTS = 4
-
-
-def _owned_media_type(gcs_path: str, user_id: uuid.UUID) -> str:
-    """Return the media type of ``gcs_path``, an upload key of ``user_id``.
-
-    Anything that is not a key this service could have issued to this very
-    user - a foreign prefix, a traversal, an unknown media type - is refused
-    before the bucket or the database is touched.
-    """
-    segments = gcs_path.split("/")
-    if len(segments) != OBJECT_PATH_SEGMENTS:
-        raise _forbidden_path()
-
-    prefix, path_user_id, media_type, filename = segments
-    if prefix != OBJECT_PATH_PREFIX or path_user_id != str(user_id) or not filename:
-        raise _forbidden_path()
-
-    try:
-        return MediaType(media_type).value
-    except ValueError:
-        raise _forbidden_path() from None
 
 
 def _forbidden_path() -> HTTPException:
@@ -99,7 +76,9 @@ def confirm_upload(
     The key is checked twice before anything is written: it has to be an
     upload key of the caller, and the object has to be in the bucket.
     """
-    media_type = _owned_media_type(payload.gcs_path, user_id)
+    media_type = storage.get_owned_media_type(payload.gcs_path, user_id)
+    if media_type is None:
+        raise _forbidden_path()
 
     if not storage.file_exists(payload.gcs_path):
         raise HTTPException(

@@ -6,15 +6,19 @@ covers an ``x-goog-content-length-range`` header, so Cloud Storage itself
 rejects anything larger than :data:`MAX_UPLOAD_BYTES`, and a client cannot lift
 the limit without invalidating the signature.
 
-The storage client is created on first use, which keeps this module importable
-(and the test suite runnable) without GCP credentials.
+The service takes its bucket and its storage client as constructor arguments,
+so it can be built with doubles. One service - and one client - is built per
+application by the lifespan, and :func:`get_storage_service` hands requests
+that very instance, which keeps this module importable (and the test suite
+runnable) without GCP credentials.
 """
 
 import json
 import uuid
 from datetime import timedelta
-from functools import lru_cache
 from typing import Any
+
+from fastapi import HTTPException, Request, status
 
 from app.core.config import ConfigError, get_settings
 from app.schemas.asset import MediaType
@@ -35,6 +39,12 @@ PUBLIC_URL_TEMPLATE = "https://storage.googleapis.com/{bucket}/{path}"
 # ``users/{user_id}/{media_type}/{uuid}.{extension}``: the user prefix keeps
 # objects greppable per owner, the random name makes collisions impossible.
 OBJECT_PATH_TEMPLATE = "users/{user_id}/{media_type}/{name}.{extension}"
+OBJECT_PATH_PREFIX = "users"
+OBJECT_PATH_SEGMENTS = 4
+
+# Answered when an application serves a request without a storage service; the
+# deployment, not the caller, is what has to be fixed.
+STORAGE_UNAVAILABLE_DETAIL = "Cloud Storage is not available"
 
 
 def _build_storage_client() -> Any:
@@ -64,30 +74,11 @@ def _build_storage_client() -> Any:
 class StorageService:
     """Signed URL issuing and object lookups for one bucket."""
 
-    def __init__(self, bucket_name: str | None = None, client: Any = None):
-        self._bucket_name = bucket_name
-        self._client = client
-
-    @property
-    def client(self) -> Any:
-        """Return the storage client, creating it on first use."""
-        if self._client is None:
-            self._client = _build_storage_client()
-        return self._client
-
-    @property
-    def bucket_name(self) -> str:
-        """Name of the bucket every object of this service lives in."""
-        if self._bucket_name is None:
-            self._bucket_name = get_settings().gcs_bucket_name
-
-        if not self._bucket_name:
-            raise ConfigError(
-                "Missing configuration: set the GCS_BUCKET_NAME environment "
-                "variable to the Cloud Storage bucket holding uploaded media"
-            )
-
-        return self._bucket_name
+    def __init__(self, bucket_name: str, client: Any):
+        #: Name of the bucket every object of this service lives in.
+        self.bucket_name = bucket_name
+        #: Cloud Storage client every request of this service goes through.
+        self.client = client
 
     def _blob(self, gcs_path: str) -> Any:
         return self.client.bucket(self.bucket_name).blob(gcs_path)
@@ -105,6 +96,29 @@ class StorageService:
             name=uuid.uuid4(),
             extension=file_extension,
         )
+
+    def get_owned_media_type(
+        self, gcs_path: str, user_id: uuid.UUID | str
+    ) -> str | None:
+        """Return the media type of ``gcs_path`` when ``user_id`` owns it.
+
+        Anything that is not a key this service could have issued to this very
+        user - a foreign prefix, a traversal, an unknown media type - yields
+        ``None``, so a caller can refuse it before the bucket or the database
+        is touched.
+        """
+        segments = gcs_path.split("/")
+        if len(segments) != OBJECT_PATH_SEGMENTS:
+            return None
+
+        prefix, path_user_id, media_type, filename = segments
+        if prefix != OBJECT_PATH_PREFIX or path_user_id != str(user_id) or not filename:
+            return None
+
+        try:
+            return MediaType(media_type).value
+        except ValueError:
+            return None
 
     def generate_signed_url(
         self,
@@ -135,7 +149,36 @@ class StorageService:
         return PUBLIC_URL_TEMPLATE.format(bucket=self.bucket_name, path=gcs_path)
 
 
-@lru_cache(maxsize=1)
-def get_storage_service() -> StorageService:
-    """Return the process wide storage service, built on first use."""
-    return StorageService()
+def _bucket_name_from_settings() -> str:
+    """Return the configured bucket name, or fail with a clear message."""
+    bucket_name = get_settings().gcs_bucket_name
+    if not bucket_name:
+        raise ConfigError(
+            "Missing configuration: set the GCS_BUCKET_NAME environment "
+            "variable to the Cloud Storage bucket holding uploaded media"
+        )
+    return bucket_name
+
+
+def build_storage_service() -> StorageService:
+    """Return a new storage service owning a new client, from the settings."""
+    return StorageService(
+        bucket_name=_bucket_name_from_settings(), client=_build_storage_client()
+    )
+
+
+def get_storage_service(request: Request) -> StorageService:
+    """FastAPI dependency returning the storage service of the application.
+
+    The service is the one the lifespan published on ``app.state``. When there
+    is none - no bucket configured, no credentials to sign with - the request
+    fails with a clear server error instead of a fresh client being built,
+    unnoticed, for every single call.
+    """
+    service = getattr(request.app.state, "storage_service", None)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=STORAGE_UNAVAILABLE_DETAIL,
+        )
+    return service
