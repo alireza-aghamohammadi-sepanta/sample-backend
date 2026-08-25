@@ -154,9 +154,14 @@ def _bucket_name_from_settings() -> str:
     return bucket_name
 
 
-@lru_cache(maxsize=1)
-def get_storage_service() -> StorageService:
-    """Return the process wide storage service, built on first use."""
+def build_storage_service() -> StorageService:
+    """Return a new storage service owning a new client, from the settings."""
     return StorageService(
         bucket_name=_bucket_name_from_settings(), client=_build_storage_client()
     )
+
+
+@lru_cache(maxsize=1)
+def get_storage_service() -> StorageService:
+    """Return the process wide storage service, built on first use."""
+    return build_storage_service()
