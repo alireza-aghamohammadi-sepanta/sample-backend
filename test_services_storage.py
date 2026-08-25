@@ -97,6 +97,16 @@ def service(client) -> StorageService:
     return StorageService(bucket_name=BUCKET, client=client)
 
 
+@pytest.fixture
+def configured(monkeypatch):
+    """Settings and a fake client factory the provider can be built from."""
+    monkeypatch.setenv("JWT_SECRET", "jwt")
+    monkeypatch.setenv("DATABASE_INSTANCE", "project:region:db")
+    monkeypatch.setattr(
+        storage_module, "_build_storage_client", lambda: FakeStorageClient()
+    )
+
+
 def test_max_upload_bytes_is_500_mb():
     assert MAX_UPLOAD_BYTES == 500 * 1024 * 1024
 
@@ -182,40 +192,75 @@ def test_public_url_points_at_the_bucket(service):
     )
 
 
-def test_client_is_built_lazily_and_only_once(monkeypatch):
-    monkeypatch.setenv("GCS_BUCKET_NAME", BUCKET)
-    monkeypatch.setattr(
-        storage_module, "_build_storage_client", lambda: FakeStorageClient()
-    )
+def test_get_owned_media_type_accepts_an_upload_key_of_the_owner(service):
+    user_id = uuid.uuid4()
 
-    service = StorageService()
-    assert FakeStorageClient.instances == []
+    for media_type in MediaType:
+        path = service.build_object_path(user_id, media_type, "bin")
 
-    assert service.client is service.client
-    assert len(FakeStorageClient.instances) == 1
+        assert service.get_owned_media_type(path, user_id) == media_type.value
 
 
-def test_bucket_name_falls_back_to_the_settings(monkeypatch, client):
-    monkeypatch.setenv("JWT_SECRET", "jwt")
-    monkeypatch.setenv("DATABASE_INSTANCE", "project:region:db")
+def test_get_owned_media_type_accepts_the_owner_id_as_a_string(service):
+    user_id = uuid.uuid4()
+    path = service.build_object_path(user_id, MediaType.IMAGE, "png")
+
+    assert service.get_owned_media_type(path, str(user_id)) == MediaType.IMAGE.value
+
+
+def test_get_owned_media_type_refuses_another_users_key(service):
+    owner = uuid.uuid4()
+    path = service.build_object_path(owner, MediaType.IMAGE, "png")
+
+    assert service.get_owned_media_type(path, uuid.uuid4()) is None
+
+
+@pytest.mark.parametrize(
+    "template",
+    (
+        "{owner}/image/name.png",  # no ``users`` prefix
+        "users/{owner}/image",  # no file name
+        "users/{owner}/image/",  # empty file name
+        "users/{owner}//name.png",  # no media type
+        "users/{owner}/image/nested/name.png",  # deeper than one file
+        "users/{owner}/audio/name.mp3",  # media type the product never issues
+        "users/../{owner}/image/name.png",  # traversal
+        "",  # nothing at all
+    ),
+)
+def test_get_owned_media_type_refuses_a_path_that_is_not_an_upload_key(
+    service, template
+):
+    user_id = uuid.uuid4()
+
+    assert service.get_owned_media_type(template.format(owner=user_id), user_id) is None
+
+
+def test_the_service_uses_the_injected_bucket_and_client(client):
+    service = StorageService(bucket_name=BUCKET, client=client)
+
+    assert service.bucket_name == BUCKET
+    assert service.client is client
+
+
+def test_get_storage_service_takes_the_bucket_name_from_the_settings(
+    monkeypatch, configured
+):
     monkeypatch.setenv("GCS_BUCKET_NAME", "from-settings")
 
-    service = StorageService(client=client)
-
-    assert service.bucket_name == "from-settings"
+    assert get_storage_service().bucket_name == "from-settings"
 
 
-def test_missing_bucket_name_is_a_config_error(monkeypatch, client):
-    monkeypatch.setenv("JWT_SECRET", "jwt")
-    monkeypatch.setenv("DATABASE_INSTANCE", "project:region:db")
-
-    service = StorageService(client=client)
-
+def test_get_storage_service_without_a_bucket_name_is_a_config_error(configured):
     with pytest.raises(ConfigError):
-        service.bucket_name
+        get_storage_service()
 
 
-def test_get_storage_service_is_cached(monkeypatch):
+def test_get_storage_service_is_cached(monkeypatch, configured):
     monkeypatch.setenv("GCS_BUCKET_NAME", BUCKET)
 
-    assert get_storage_service() is get_storage_service()
+    service = get_storage_service()
+
+    assert get_storage_service() is service
+    # The Cloud Storage client is built once, by the first call.
+    assert FakeStorageClient.instances == [service.client]
