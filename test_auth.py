@@ -12,6 +12,7 @@ import hashlib
 import os
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import jwt
@@ -27,7 +28,7 @@ from sqlalchemy.orm import Session
 from app.core import security
 from app.core.config import get_settings
 from app.db.session import get_db
-from app.models import User
+from app.models import PasswordResetToken, User
 from app.schemas.user import ForgotPasswordRequest, ResetPasswordRequest
 from main import app
 
@@ -470,4 +471,229 @@ def test_reset_password_request_missing_token():
 def test_reset_password_request_empty_token():
     with pytest.raises(ValidationError):
         ResetPasswordRequest(token="", new_password="validpassword123")
+
+
+# --- forgot password endpoint tests (POST /auth/forgot-password) -----------
+
+
+def test_forgot_password_route_is_registered():
+    paths = app.openapi()["paths"]
+    assert "/auth/forgot-password" in paths
+    assert "post" in paths["/auth/forgot-password"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"email": "not-an-email"}, id="malformed-email"),
+        pytest.param({"email": ""}, id="empty-email"),
+        pytest.param({"email": "user@"}, id="trailing-at-email"),
+        pytest.param({"email": "@domain.com"}, id="missing-local-part"),
+        pytest.param({}, id="missing-email"),
+        pytest.param({"email": 12345}, id="numeric-email"),
+    ],
+)
+def test_forgot_password_invalid_email_returns_422(offline_client, payload):
+    response = offline_client.post("/auth/forgot-password", json=payload)
+    assert response.status_code == 422
+    assert_no_storage_details(response)
+
+
+@requires_database
+def test_forgot_password_registered_user_persists_token_and_dispatches_email(
+    client, db_session
+):
+    from app.services.email import EmailService, get_email_service
+
+    email_service = EmailService()
+    app.dependency_overrides[get_email_service] = lambda: email_service
+
+    try:
+        # Create a registered user
+        user = User(
+            email="alice@example.com",
+            hashed_password=security.get_password_hash("password123"),
+        )
+        db_session.add(user)
+        db_session.commit()
+        db_session.refresh(user)
+
+        # Call forgot-password endpoint
+        response = client.post(
+            "/auth/forgot-password",
+            json={"email": "alice@example.com"},
+        )
+
+        assert response.status_code == 200
+        assert "message" in response.json()
+        assert_no_storage_details(response)
+
+        # Check that a token row was persisted
+        tokens = list(
+            db_session.execute(
+                sa.select(PasswordResetToken).where(PasswordResetToken.user_id == user.id)
+            ).scalars()
+        )
+        assert len(tokens) == 1
+        token_record = tokens[0]
+        assert token_record.user_id == user.id
+        assert len(token_record.token_hash) == 64
+        assert token_record.used_at is None
+
+        # Check token expiration (~15 minutes in future)
+        now = datetime.now(timezone.utc)
+        assert token_record.expires_at > now
+        remaining_seconds = (token_record.expires_at - now).total_seconds()
+        assert 13 * 60 <= remaining_seconds <= 16 * 60
+
+        # Check email dispatch
+        assert len(email_service.sent_emails) == 1
+        sent = email_service.sent_emails[0]
+        assert sent["to_email"] == "alice@example.com"
+        assert security.hash_reset_token(sent["reset_token"]) == token_record.token_hash
+        assert sent["reset_token"] in sent["reset_url"]
+    finally:
+        app.dependency_overrides.pop(get_email_service, None)
+
+
+@requires_database
+def test_forgot_password_unregistered_email_returns_identical_200(client, db_session):
+    from app.services.email import EmailService, get_email_service
+
+    email_service = EmailService()
+    app.dependency_overrides[get_email_service] = lambda: email_service
+
+    try:
+        # Registered user response
+        user = User(
+            email="registered@example.com",
+            hashed_password=security.get_password_hash("password123"),
+        )
+        db_session.add(user)
+        db_session.commit()
+
+        registered_resp = client.post(
+            "/auth/forgot-password",
+            json={"email": "registered@example.com"},
+        )
+        assert registered_resp.status_code == 200
+
+        # Reset email service counter
+        email_service.sent_emails.clear()
+
+        # Unregistered user response
+        unregistered_resp = client.post(
+            "/auth/forgot-password",
+            json={"email": "unregistered@example.com"},
+        )
+        assert unregistered_resp.status_code == 200
+        assert unregistered_resp.json() == registered_resp.json()
+        assert_no_storage_details(unregistered_resp)
+
+        # Ensure no reset token was created for unregistered email
+        token_count = db_session.execute(
+            sa.select(sa.func.count()).select_from(PasswordResetToken)
+        ).scalar_one()
+        # Exactly 1 token exists (the one from registered user)
+        assert token_count == 1
+
+        # Ensure no email was sent for unregistered user
+        assert len(email_service.sent_emails) == 0
+    finally:
+        app.dependency_overrides.pop(get_email_service, None)
+
+
+@requires_database
+def test_forgot_password_normalizes_email_case(client, db_session):
+    user = User(
+        email="bob@example.com",
+        hashed_password=security.get_password_hash("password123"),
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    response = client.post(
+        "/auth/forgot-password",
+        json={"email": "  Bob@Example.COM  "},
+    )
+    assert response.status_code == 200
+
+    token_record = db_session.execute(
+        sa.select(PasswordResetToken).where(PasswordResetToken.user_id == user.id)
+    ).scalar_one()
+    assert token_record is not None
+
+
+# --- EmailService unit tests ----------------------------------------------
+
+
+def test_email_service_send_password_reset_email():
+    from app.services.email import EmailService
+
+    service = EmailService()
+    service.send_password_reset_email("user@example.com", "reset-token-123")
+
+    assert len(service.sent_emails) == 1
+    sent = service.sent_emails[0]
+    assert sent["to_email"] == "user@example.com"
+    assert sent["reset_token"] == "reset-token-123"
+    assert "/reset-password?token=reset-token-123" in sent["reset_url"]
+    assert sent["subject"] == "Password Reset Request"
+
+
+def test_email_service_send_password_reset_email_custom_url():
+    from app.services.email import EmailService
+
+    service = EmailService()
+    service.send_password_reset_email(
+        "user@example.com",
+        "token-456",
+        reset_url="https://app.example.com/reset?token=token-456",
+    )
+
+    assert len(service.sent_emails) == 1
+    sent = service.sent_emails[0]
+    assert sent["reset_url"] == "https://app.example.com/reset?token=token-456"
+
+
+def test_email_service_send_email():
+    from app.services.email import EmailService
+
+    service = EmailService()
+    service.send_email("user@example.com", "Welcome", "Welcome to our app!")
+
+    assert len(service.sent_emails) == 1
+    sent = service.sent_emails[0]
+    assert sent["to_email"] == "user@example.com"
+    assert sent["subject"] == "Welcome"
+    assert sent["body"] == "Welcome to our app!"
+
+
+def test_get_email_service_and_build():
+    from starlette.datastructures import State
+    from starlette.requests import Request
+
+    from app.services.email import (
+        EmailService,
+        build_email_service,
+        get_email_service,
+    )
+
+    built = build_email_service()
+    assert isinstance(built, EmailService)
+
+    fallback = get_email_service()
+    assert isinstance(fallback, EmailService)
+
+    class FakeApp:
+        def __init__(self, **state):
+            self.state = State(state)
+
+    custom_service = EmailService()
+    req = Request({"type": "http", "app": FakeApp(email_service=custom_service)})
+    assert get_email_service(req) is custom_service
+
+
+
 
