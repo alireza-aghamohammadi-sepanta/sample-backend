@@ -21,9 +21,11 @@ from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
 from app.core import security
 from app.core.config import get_settings
+from app.db import Base
 from app.db.session import get_db
 from app.models import User
 from main import app
@@ -144,6 +146,13 @@ def test_signup_route_is_registered():
 
     assert "/signup" in paths
     assert "post" in paths["/signup"]
+
+
+def test_login_route_is_registered():
+    paths = app.openapi()["paths"]
+
+    assert "/login" in paths
+    assert "post" in paths["/login"]
 
 
 def test_existing_routes_are_untouched(offline_client):
@@ -369,3 +378,213 @@ def test_invalid_payloads_return_422(offline_client, payload):
 
     assert response.status_code == 422
     assert_no_storage_details(response)
+
+
+# --- login endpoints -------------------------------------------------------
+
+
+@pytest.fixture
+def sqlite_session():
+    """A session on a throwaway database holding the whole model schema."""
+    engine = sa.create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    try:
+        with Session(engine) as session:
+            yield session
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture
+def auth_client(sqlite_session):
+    with client_using(sqlite_session) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def registered_user(sqlite_session) -> User:
+    user = User(
+        id=uuid.uuid4(),
+        email="alice@example.com",
+        hashed_password=security.get_password_hash("correct-horse-battery"),
+    )
+    sqlite_session.add(user)
+    sqlite_session.commit()
+    return user
+
+
+# --- AC-1: successful login ------------------------------------------------
+
+
+def test_login_returns_200_with_a_token(auth_client, registered_user):
+    response = auth_client.post(
+        "/login",
+        json={"email": "alice@example.com", "password": "correct-horse-battery"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["token_type"] == "bearer"
+    assert body["access_token"]
+
+
+def test_login_token_is_signed_for_the_user(auth_client, registered_user):
+    response = auth_client.post(
+        "/login",
+        json={"email": "alice@example.com", "password": "correct-horse-battery"},
+    )
+    token = response.json()["access_token"]
+
+    payload = jwt.decode(token, SECRET, algorithms=[security.ALGORITHM])
+    assert payload["sub"] == str(registered_user.id)
+    assert uuid.UUID(payload["sub"]) == registered_user.id
+    assert payload["exp"] > payload["iat"]
+
+
+def test_login_normalises_the_email(auth_client, registered_user):
+    response = auth_client.post(
+        "/login",
+        json={"email": "  Alice@Example.COM  ", "password": "correct-horse-battery"},
+    )
+
+    assert response.status_code == 200
+    token = response.json()["access_token"]
+    payload = jwt.decode(token, SECRET, algorithms=[security.ALGORITHM])
+    assert payload["sub"] == str(registered_user.id)
+
+
+def test_login_response_never_carries_the_password(auth_client, registered_user):
+    response = auth_client.post(
+        "/login",
+        json={"email": "alice@example.com", "password": "correct-horse-battery"},
+    )
+
+    assert response.status_code == 200
+    assert "correct-horse-battery" not in response.text
+    assert "password" not in response.json()
+
+
+# --- AC-2: incorrect password rejection ------------------------------------
+
+
+def test_login_with_incorrect_password_returns_401(auth_client, registered_user):
+    response = auth_client.post(
+        "/login",
+        json={"email": "alice@example.com", "password": "wrong-password-123"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid email or password"
+    assert_no_storage_details(response)
+
+
+# --- AC-3: non-existent email rejection -----------------------------------
+
+
+def test_login_with_non_existent_email_returns_401(auth_client, sqlite_session):
+    response = auth_client.post(
+        "/login",
+        json={"email": "nonexistent@example.com", "password": "correct-horse-battery"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid email or password"
+    assert_no_storage_details(response)
+
+
+def test_login_error_detail_is_identical_for_wrong_password_and_missing_user(
+    auth_client, registered_user
+):
+    wrong_password_response = auth_client.post(
+        "/login",
+        json={"email": "alice@example.com", "password": "wrong-password-123"},
+    )
+    missing_user_response = auth_client.post(
+        "/login",
+        json={"email": "nonexistent@example.com", "password": "correct-horse-battery"},
+    )
+
+    assert wrong_password_response.status_code == 401
+    assert missing_user_response.status_code == 401
+    assert wrong_password_response.json() == missing_user_response.json() == {"detail": "Invalid email or password"}
+
+
+# --- AC-4: malformed payload rejection -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(
+            {"email": "not-an-email", "password": "correct-horse-battery"},
+            id="malformed-email",
+        ),
+        pytest.param(
+            {"email": "", "password": "correct-horse-battery"}, id="empty-email"
+        ),
+        pytest.param({"password": "correct-horse-battery"}, id="missing-email"),
+        pytest.param({"email": "alice@example.com"}, id="missing-password"),
+        pytest.param({}, id="empty-body"),
+        pytest.param(
+            {"email": "alice@example.com", "password": "short"}, id="short-password"
+        ),
+    ],
+)
+def test_login_invalid_payloads_return_422(offline_client, payload):
+    response = offline_client.post("/login", json=payload)
+
+    assert response.status_code == 422
+    assert_no_storage_details(response)
+
+
+# --- PostgreSQL integration tests for login -------------------------------
+
+
+@requires_database
+def test_postgres_login_successful(client, db_session):
+    # First sign up the user through the real endpoint
+    signup_res = client.post(
+        "/signup",
+        json={"email": "alice@example.com", "password": "correct-horse-battery"},
+    )
+    assert signup_res.status_code == 201
+
+    login_res = client.post(
+        "/login",
+        json={"email": "Alice@example.com", "password": "correct-horse-battery"},
+    )
+    assert login_res.status_code == 200
+    token = login_res.json()["access_token"]
+    payload = jwt.decode(token, SECRET, algorithms=[security.ALGORITHM])
+    user = db_session.execute(sa.select(User)).scalar_one()
+    assert payload["sub"] == str(user.id)
+
+
+@requires_database
+def test_postgres_login_wrong_password(client, db_session):
+    signup_res = client.post(
+        "/signup",
+        json={"email": "alice@example.com", "password": "correct-horse-battery"},
+    )
+    assert signup_res.status_code == 201
+
+    login_res = client.post(
+        "/login",
+        json={"email": "alice@example.com", "password": "wrong-password-123"},
+    )
+    assert login_res.status_code == 401
+    assert login_res.json()["detail"] == "Invalid email or password"
+
+
+@requires_database
+def test_postgres_login_non_existent_user(client, db_session):
+    login_res = client.post(
+        "/login",
+        json={"email": "nobody@example.com", "password": "correct-horse-battery"},
+    )
+    assert login_res.status_code == 401
+    assert login_res.json()["detail"] == "Invalid email or password"

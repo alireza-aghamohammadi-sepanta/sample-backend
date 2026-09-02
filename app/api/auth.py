@@ -1,6 +1,6 @@
 """Authentication endpoints.
 
-Only registration lives here for now. The handler never logs nor echoes the
+Registration and login endpoints live here. Handlers never log nor echo the
 plaintext password, and every storage failure is translated into a plain
 message so no SQL or driver detail reaches the client.
 """
@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.security import create_access_token, get_password_hash
+from app.core.security import create_access_token, get_password_hash, verify_password
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.user import Token, UserCreate
@@ -18,6 +18,7 @@ from app.schemas.user import Token, UserCreate
 router = APIRouter(tags=["auth"])
 
 EMAIL_TAKEN_DETAIL = "Email already registered"
+INVALID_CREDENTIALS_DETAIL = "Invalid email or password"
 
 
 @router.post("/signup", response_model=Token, status_code=status.HTTP_201_CREATED)
@@ -46,3 +47,18 @@ def signup(payload: UserCreate, db: Session = Depends(get_db)) -> Token:
 
     db.refresh(user)
     return Token(access_token=create_access_token(subject=str(user.id)))
+
+
+@router.post("/login", response_model=Token)
+def login(payload: UserCreate, db: Session = Depends(get_db)) -> Token:
+    """Authenticate with email and password and return an access token."""
+    email = payload.normalized_email
+
+    user = db.scalar(select(User).where(User.email == email))
+    if user is None or not verify_password(payload.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=INVALID_CREDENTIALS_DETAIL,
+        )
+
+    return Token(access_token=create_access_token(user.id), token_type="bearer")
