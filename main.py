@@ -17,6 +17,7 @@ from fastapi import FastAPI
 
 from app.api import assets, auth
 from app.db.session import DatabaseManager
+from app.services.email import build_email_service
 from app.services.storage import StorageService, build_storage_service
 
 
@@ -48,6 +49,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Build the shared dependencies on startup, release them on shutdown."""
     app.state.db_manager = DatabaseManager()
     app.state.storage_service = _build_storage_service()
+    app.state.email_service = build_email_service()
     try:
         yield
     finally:

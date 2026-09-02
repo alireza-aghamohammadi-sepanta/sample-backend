@@ -6,7 +6,9 @@ read at call time so a rotated secret is picked up without a restart of the
 module import machinery.
 """
 
+import hashlib
 import os
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -40,6 +42,16 @@ def get_password_hash(password: str) -> str:
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Return whether ``plain_password`` matches ``hashed_password``."""
     return pwd_context.verify(plain_password, hashed_password)
+
+
+def generate_password_reset_token() -> str:
+    """Generate a secure random token for password reset."""
+    return secrets.token_urlsafe(32)
+
+
+def hash_reset_token(token: str) -> str:
+    """Return a SHA-256 hash of a password reset token."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def access_token_expire_minutes() -> int:

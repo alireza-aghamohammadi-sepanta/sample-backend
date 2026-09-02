@@ -1,3 +1,4 @@
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 import jwt
@@ -158,3 +159,24 @@ def test_decode_access_token_rejects_a_tampered_token():
 
     with pytest.raises(jwt.InvalidTokenError):
         security.decode_access_token(tampered)
+
+
+# --- password reset tokens ------------------------------------------------
+
+
+def test_generate_password_reset_token_returns_random_string():
+    token1 = security.generate_password_reset_token()
+    token2 = security.generate_password_reset_token()
+
+    assert isinstance(token1, str)
+    assert len(token1) >= 32
+    assert token1 != token2
+
+
+def test_hash_reset_token_returns_sha256_digest():
+    token = "some-random-token-string"
+    expected = hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    assert security.hash_reset_token(token) == expected
+    assert len(security.hash_reset_token(token)) == 64
+
