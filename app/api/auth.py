@@ -21,7 +21,12 @@ from app.core.security import (
 from app.db.session import get_db
 from app.models.password_reset_token import PasswordResetToken
 from app.models.user import User
-from app.schemas.user import ForgotPasswordRequest, Token, UserCreate
+from app.schemas.user import (
+    ForgotPasswordRequest,
+    ResetPasswordRequest,
+    Token,
+    UserCreate,
+)
 from app.services.email import EmailService, get_email_service
 
 router = APIRouter(tags=["auth"])
@@ -30,6 +35,7 @@ EMAIL_TAKEN_DETAIL = "Email already registered"
 FORGOT_PASSWORD_GENERIC_MESSAGE = (
     "If the email is registered, a password reset link has been sent."
 )
+INVALID_RESET_TOKEN_DETAIL = "Invalid or expired reset token"
 RESET_TOKEN_EXPIRE_MINUTES = 15
 
 
@@ -98,3 +104,52 @@ def forgot_password(
         )
 
     return {"message": FORGOT_PASSWORD_GENERIC_MESSAGE}
+
+
+@router.post("/auth/reset-password", response_model=Token, status_code=status.HTTP_200_OK)
+@router.post("/reset-password", response_model=Token, status_code=status.HTTP_200_OK, include_in_schema=False)
+def reset_password(
+    payload: ResetPasswordRequest,
+    db: Session = Depends(get_db),
+) -> Token:
+    """Reset user password using a valid, unexpired, single-use token.
+
+    Verifies the SHA-256 hash of the token against stored tokens, updates the
+    user's password with Argon2, marks the token as used, and returns an access token.
+    """
+    token_hash = hash_reset_token(payload.token)
+    reset_token_record = db.scalar(
+        select(PasswordResetToken).where(PasswordResetToken.token_hash == token_hash)
+    )
+
+    if reset_token_record is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=INVALID_RESET_TOKEN_DETAIL,
+        )
+
+    now = datetime.now(timezone.utc)
+    expires_at = reset_token_record.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    if expires_at < now or reset_token_record.used_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=INVALID_RESET_TOKEN_DETAIL,
+        )
+
+    user = db.scalar(select(User).where(User.id == reset_token_record.user_id))
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=INVALID_RESET_TOKEN_DETAIL,
+        )
+
+    user.hashed_password = get_password_hash(payload.new_password)
+    reset_token_record.used_at = now
+    db.commit()
+    db.refresh(user)
+
+    return Token(access_token=create_access_token(subject=str(user.id)))
+
