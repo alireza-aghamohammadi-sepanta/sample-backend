@@ -8,6 +8,7 @@ which keeps the committed suite runnable without any service. The validation
 scenarios never reach the database and therefore always run.
 """
 
+import hashlib
 import os
 import uuid
 from contextlib import contextmanager
@@ -19,6 +20,7 @@ import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -26,6 +28,7 @@ from app.core import security
 from app.core.config import get_settings
 from app.db.session import get_db
 from app.models import User
+from app.schemas.user import ForgotPasswordRequest, ResetPasswordRequest
 from main import app
 
 ENV_VARS = (
@@ -369,3 +372,102 @@ def test_invalid_payloads_return_422(offline_client, payload):
 
     assert response.status_code == 422
     assert_no_storage_details(response)
+
+
+# --- password reset security utilities ------------------------------------
+
+
+def test_generate_password_reset_token_returns_non_empty_string():
+    token = security.generate_password_reset_token()
+    assert isinstance(token, str)
+    assert len(token) >= 32
+
+
+def test_generate_password_reset_token_is_random():
+    t1 = security.generate_password_reset_token()
+    t2 = security.generate_password_reset_token()
+    assert t1 != t2
+
+
+def test_hash_reset_token_returns_sha256_hex_digest():
+    token = "test-reset-token-value"
+    expected = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    assert security.hash_reset_token(token) == expected
+    assert len(security.hash_reset_token(token)) == 64
+
+
+def test_hash_reset_token_is_deterministic():
+    token = "deterministic-token"
+    assert security.hash_reset_token(token) == security.hash_reset_token(token)
+
+
+def test_hash_reset_token_differs_for_different_inputs():
+    assert security.hash_reset_token("token-a") != security.hash_reset_token("token-b")
+
+
+# --- forgot / reset password schema constraints ---------------------------
+
+
+def test_forgot_password_request_valid_email():
+    req = ForgotPasswordRequest(email="user@example.com")
+    assert req.email == "user@example.com"
+    assert req.normalized_email == "user@example.com"
+
+
+def test_forgot_password_request_normalizes_email():
+    req = ForgotPasswordRequest(email="  User.Name@Example.COM  ")
+    assert req.normalized_email == "user.name@example.com"
+
+
+@pytest.mark.parametrize("invalid_email", ["not-an-email", "", "user@", "@domain.com"])
+def test_forgot_password_request_invalid_email(invalid_email):
+    with pytest.raises(ValidationError):
+        ForgotPasswordRequest(email=invalid_email)
+
+
+def test_forgot_password_request_missing_email():
+    with pytest.raises(ValidationError):
+        ForgotPasswordRequest.model_validate({})
+
+
+def test_reset_password_request_valid():
+    req = ResetPasswordRequest(token="token-abc", new_password="validpassword123")
+    assert req.token == "token-abc"
+    assert req.new_password == "validpassword123"
+    assert req.password == "validpassword123"
+
+
+def test_reset_password_request_password_alias():
+    req = ResetPasswordRequest(token="token-abc", password="validpassword123")
+    assert req.token == "token-abc"
+    assert req.new_password == "validpassword123"
+    assert req.password == "validpassword123"
+
+
+def test_reset_password_request_password_length_bounds():
+    req_min = ResetPasswordRequest(token="tok", new_password="a" * 8)
+    assert len(req_min.new_password) == 8
+
+    req_max = ResetPasswordRequest(token="tok", new_password="a" * 128)
+    assert len(req_max.new_password) == 128
+
+
+def test_reset_password_request_rejects_short_password():
+    with pytest.raises(ValidationError):
+        ResetPasswordRequest(token="tok", new_password="short")
+
+
+def test_reset_password_request_rejects_long_password():
+    with pytest.raises(ValidationError):
+        ResetPasswordRequest(token="tok", new_password="a" * 129)
+
+
+def test_reset_password_request_missing_token():
+    with pytest.raises(ValidationError):
+        ResetPasswordRequest.model_validate({"new_password": "validpassword123"})
+
+
+def test_reset_password_request_empty_token():
+    with pytest.raises(ValidationError):
+        ResetPasswordRequest(token="", new_password="validpassword123")
+

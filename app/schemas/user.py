@@ -2,7 +2,7 @@
 
 import uuid
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, EmailStr, Field
 
 # Argon2 accepts any length; a floor of 8 characters keeps trivially guessable
 # passwords out without imposing a policy the frontend cannot explain.
@@ -39,3 +39,32 @@ class Token(BaseModel):
 
     access_token: str
     token_type: str = "bearer"
+
+
+class ForgotPasswordRequest(BaseModel):
+    """Payload of a forgot password request."""
+
+    email: EmailStr
+
+    @property
+    def normalized_email(self) -> str:
+        """The address as it is stored: lowercased, without surrounding space."""
+        return self.email.strip().lower()
+
+
+class ResetPasswordRequest(BaseModel):
+    """Payload of a password reset request."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    token: str = Field(min_length=1)
+    new_password: str = Field(
+        min_length=MIN_PASSWORD_LENGTH,
+        max_length=MAX_PASSWORD_LENGTH,
+        validation_alias=AliasChoices("new_password", "password"),
+    )
+
+    @property
+    def password(self) -> str:
+        return self.new_password
+
