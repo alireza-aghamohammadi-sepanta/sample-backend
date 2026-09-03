@@ -7,6 +7,12 @@ from app.schemas.asset import (
     SignedURLRequest,
     SignedURLResponse,
 )
+from app.schemas.todo import (
+    TodoBase,
+    TodoCreate,
+    TodoRead,
+    TodoUpdate,
+)
 from app.schemas.user import Token, UserCreate, UserRead
 
 __all__ = [
@@ -15,6 +21,10 @@ __all__ = [
     "MediaType",
     "SignedURLRequest",
     "SignedURLResponse",
+    "TodoBase",
+    "TodoCreate",
+    "TodoRead",
+    "TodoUpdate",
     "Token",
     "UserCreate",
     "UserRead",

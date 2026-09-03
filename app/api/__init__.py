@@ -1,5 +1,5 @@
 """HTTP routers of the application."""
 
-from app.api import auth
+from app.api import assets, auth, todos
 
-__all__ = ["auth"]
+__all__ = ["assets", "auth", "todos"]

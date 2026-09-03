@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import assets, auth
+from app.api import assets, auth, todos
 from app.db.session import DatabaseManager
 from app.services.email import build_email_service
 from app.services.storage import StorageService, build_storage_service
@@ -61,6 +61,7 @@ app = FastAPI(lifespan=lifespan)
 
 app.include_router(auth.router)
 app.include_router(assets.router)
+app.include_router(todos.router)
 
 @app.get("/")
 async def root():
