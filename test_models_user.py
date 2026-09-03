@@ -53,6 +53,7 @@ def test_migrations_have_a_single_head():
     config = Config(str(Path(__file__).parent / "alembic.ini"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["002"]
+    assert script.get_heads() == ["003"]
     assert script.get_revision("001").down_revision is None
     assert script.get_revision("002").down_revision == "001"
+    assert script.get_revision("003").down_revision == "002"
