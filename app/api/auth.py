@@ -17,6 +17,7 @@ from app.core.security import (
     generate_password_reset_token,
     get_password_hash,
     hash_reset_token,
+    verify_password,
 )
 from app.db.session import get_db
 from app.models.password_reset_token import PasswordResetToken
@@ -26,6 +27,7 @@ from app.schemas.user import (
     ResetPasswordRequest,
     Token,
     UserCreate,
+    UserLogin,
 )
 from app.services.email import EmailService, get_email_service
 
@@ -35,6 +37,7 @@ EMAIL_TAKEN_DETAIL = "Email already registered"
 FORGOT_PASSWORD_GENERIC_MESSAGE = (
     "If the email is registered, a password reset link has been sent."
 )
+INVALID_CREDENTIALS_DETAIL = "Invalid credentials"
 INVALID_RESET_TOKEN_DETAIL = "Invalid or expired reset token"
 RESET_TOKEN_EXPIRE_MINUTES = 15
 
@@ -64,6 +67,21 @@ def signup(payload: UserCreate, db: Session = Depends(get_db)) -> Token:
         ) from None
 
     db.refresh(user)
+    return Token(access_token=create_access_token(subject=str(user.id)))
+
+
+@router.post("/auth/login", response_model=Token, status_code=status.HTTP_200_OK)
+@router.post("/login", response_model=Token, status_code=status.HTTP_200_OK, include_in_schema=False)
+def login(payload: UserLogin, db: Session = Depends(get_db)) -> Token:
+    """Authenticate a user and return an access token."""
+    email = payload.normalized_email
+    user = db.scalar(select(User).where(User.email == email))
+    if user is None or not verify_password(payload.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=INVALID_CREDENTIALS_DETAIL,
+        )
+
     return Token(access_token=create_access_token(subject=str(user.id)))
 
 

@@ -13,7 +13,7 @@ from app.schemas.todo import (
     TodoRead,
     TodoUpdate,
 )
-from app.schemas.user import Token, UserCreate, UserRead
+from app.schemas.user import Token, UserCreate, UserLogin, UserRead
 
 __all__ = [
     "AssetConfirmRequest",
@@ -27,5 +27,6 @@ __all__ = [
     "TodoUpdate",
     "Token",
     "UserCreate",
+    "UserLogin",
     "UserRead",
 ]

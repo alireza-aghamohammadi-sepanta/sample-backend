@@ -25,6 +25,18 @@ class UserCreate(BaseModel):
         return self.email.strip().lower()
 
 
+class UserLogin(BaseModel):
+    """Payload of a login request."""
+
+    email: EmailStr
+    password: str
+
+    @property
+    def normalized_email(self) -> str:
+        """The address as it is stored: lowercased, without surrounding space."""
+        return self.email.strip().lower()
+
+
 class UserRead(BaseModel):
     """Public view of an account: never carries the password hash."""
 

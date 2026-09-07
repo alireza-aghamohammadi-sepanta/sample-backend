@@ -29,7 +29,11 @@ from app.core import security
 from app.core.config import get_settings
 from app.db.session import get_db
 from app.models import PasswordResetToken, User
-from app.schemas.user import ForgotPasswordRequest, ResetPasswordRequest
+from app.schemas.user import (
+    ForgotPasswordRequest,
+    ResetPasswordRequest,
+    UserLogin,
+)
 from main import app
 
 ENV_VARS = (
@@ -977,6 +981,245 @@ def test_reset_password_no_sensitive_data_leaked_in_logs_or_response(
     for record in caplog.records:
         assert secret_new_password not in record.getMessage()
         assert raw_token not in record.getMessage()
+
+
+# --- User Login endpoint and schema tests ----------------------------------
+
+
+class MockLoginSession:
+    """Mock session for login unit tests."""
+
+    def __init__(self, users: list[User] | None = None):
+        self._users = {u.email: u for u in (users or [])}
+
+    def scalar(self, stmt):
+        params = stmt.compile().params
+        for val in params.values():
+            if isinstance(val, str) and val in self._users:
+                return self._users[val]
+        return None
+
+
+def test_login_route_is_registered():
+    paths = app.openapi()["paths"]
+    assert "/auth/login" in paths
+    assert "post" in paths["/auth/login"]
+
+
+def test_user_login_schema_valid():
+    schema = UserLogin(email="alice@example.com", password="my-secret-password")
+    assert schema.email == "alice@example.com"
+    assert schema.password == "my-secret-password"
+    assert schema.normalized_email == "alice@example.com"
+
+
+def test_user_login_schema_normalizes_email():
+    schema = UserLogin(email="  Alice@Example.COM  ", password="my-secret-password")
+    assert schema.normalized_email == "alice@example.com"
+
+
+def test_user_login_schema_invalid_email():
+    with pytest.raises(ValidationError):
+        UserLogin(email="not-an-email", password="my-secret-password")
+
+
+def test_user_login_schema_missing_password():
+    with pytest.raises(ValidationError):
+        UserLogin(email="alice@example.com")
+
+
+def test_login_successful_with_jwt_return():
+    user = User(
+        id=uuid.uuid4(),
+        email="alice@example.com",
+        hashed_password=security.get_password_hash("correct-horse-battery"),
+    )
+    session = MockLoginSession([user])
+    with client_using(session) as test_client:
+        response = test_client.post(
+            "/auth/login",
+            json={"email": "alice@example.com", "password": "correct-horse-battery"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["token_type"] == "bearer"
+    assert "access_token" in body
+
+    payload = jwt.decode(body["access_token"], SECRET, algorithms=[security.ALGORITHM])
+    assert payload["sub"] == str(user.id)
+    assert payload["exp"] > payload["iat"]
+
+
+def test_login_alias_route_successful():
+    user = User(
+        id=uuid.uuid4(),
+        email="alice@example.com",
+        hashed_password=security.get_password_hash("correct-horse-battery"),
+    )
+    session = MockLoginSession([user])
+    with client_using(session) as test_client:
+        response = test_client.post(
+            "/login",
+            json={"email": "alice@example.com", "password": "correct-horse-battery"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["token_type"] == "bearer"
+    assert "access_token" in body
+
+
+def test_login_case_insensitive_email_matching():
+    user = User(
+        id=uuid.uuid4(),
+        email="alice@example.com",
+        hashed_password=security.get_password_hash("correct-horse-battery"),
+    )
+    session = MockLoginSession([user])
+    with client_using(session) as test_client:
+        response = test_client.post(
+            "/auth/login",
+            json={"email": "  ALICE@Example.COM  ", "password": "correct-horse-battery"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["token_type"] == "bearer"
+    assert "access_token" in body
+
+
+def test_login_invalid_password_returns_401():
+    user = User(
+        id=uuid.uuid4(),
+        email="alice@example.com",
+        hashed_password=security.get_password_hash("correct-horse-battery"),
+    )
+    session = MockLoginSession([user])
+    with client_using(session) as test_client:
+        response = test_client.post(
+            "/auth/login",
+            json={"email": "alice@example.com", "password": "wrong-password"},
+        )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid credentials"}
+    assert_no_storage_details(response)
+
+
+def test_login_non_existent_user_returns_401():
+    session = MockLoginSession([])
+    with client_using(session) as test_client:
+        response = test_client.post(
+            "/auth/login",
+            json={"email": "nonexistent@example.com", "password": "any-password"},
+        )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid credentials"}
+    assert_no_storage_details(response)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"email": "not-an-email", "password": "password123"}, id="malformed-email"),
+        pytest.param({"email": "", "password": "password123"}, id="empty-email"),
+        pytest.param({"password": "password123"}, id="missing-email"),
+        pytest.param({"email": "alice@example.com"}, id="missing-password"),
+        pytest.param({}, id="empty-body"),
+    ],
+)
+def test_login_invalid_payload_returns_422(offline_client, payload):
+    response = offline_client.post("/auth/login", json=payload)
+    assert response.status_code == 422
+    assert_no_storage_details(response)
+
+
+def test_login_no_sensitive_data_leaked():
+    user = User(
+        id=uuid.uuid4(),
+        email="alice@example.com",
+        hashed_password=security.get_password_hash("super-secret-password"),
+    )
+    session = MockLoginSession([user])
+    with client_using(session) as test_client:
+        response = test_client.post(
+            "/auth/login",
+            json={"email": "alice@example.com", "password": "super-secret-password"},
+        )
+
+    assert response.status_code == 200
+    assert "super-secret-password" not in response.text
+    assert_no_storage_details(response)
+
+
+@requires_database
+def test_db_login_successful(client, db_session):
+    user = User(
+        email="dbuser@example.com",
+        hashed_password=security.get_password_hash("db-secret-password"),
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    response = client.post(
+        "/auth/login",
+        json={"email": "dbuser@example.com", "password": "db-secret-password"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["token_type"] == "bearer"
+    assert "access_token" in body
+
+    payload = jwt.decode(body["access_token"], SECRET, algorithms=[security.ALGORITHM])
+    assert payload["sub"] == str(user.id)
+
+
+@requires_database
+def test_db_login_invalid_password(client, db_session):
+    user = User(
+        email="dbuser2@example.com",
+        hashed_password=security.get_password_hash("db-secret-password"),
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    response = client.post(
+        "/auth/login",
+        json={"email": "dbuser2@example.com", "password": "wrong-password"},
+    )
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid credentials"}
+
+
+@requires_database
+def test_db_login_non_existent_user(client, db_session):
+    response = client.post(
+        "/auth/login",
+        json={"email": "nosuchuser@example.com", "password": "password"},
+    )
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid credentials"}
+
+
+@requires_database
+def test_db_login_case_insensitive_email(client, db_session):
+    user = User(
+        email="dbuser3@example.com",
+        hashed_password=security.get_password_hash("db-secret-password"),
+    )
+    db_session.add(user)
+    db_session.commit()
+
+    response = client.post(
+        "/auth/login",
+        json={"email": "  DBUSER3@EXAMPLE.COM  ", "password": "db-secret-password"},
+    )
+    assert response.status_code == 200
+    assert "access_token" in response.json()
+
 
 
 
