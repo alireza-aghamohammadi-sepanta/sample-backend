@@ -25,6 +25,13 @@ class Asset(Base):
         nullable=False,
         index=True,
     )
+    todo_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("todos.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+        default=None,
+    )
     gcs_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     public_url: Mapped[str] = mapped_column(String(2048), nullable=False)
     media_type: Mapped[str] = mapped_column(String(255), nullable=False)

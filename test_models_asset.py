@@ -19,7 +19,7 @@ def test_asset_is_mapped_on_the_shared_base():
 
 def test_asset_columns():
     columns = {column.name for column in Asset.__table__.columns}
-    assert {"id", "user_id", "gcs_path", "public_url", "media_type"} <= columns
+    assert {"id", "user_id", "todo_id", "gcs_path", "public_url", "media_type"} <= columns
 
 
 def test_id_is_a_uuid_primary_key_with_a_default():
@@ -39,6 +39,18 @@ def test_user_id_references_the_users_table():
 
     foreign_key, = column.foreign_keys
     assert foreign_key.column is Base.metadata.tables["users"].c.id
+
+
+def test_todo_id_references_the_todos_table():
+    column = Asset.__table__.c.todo_id
+
+    assert column.nullable is True
+    assert column.index is True
+    assert isinstance(column.type, sa.Uuid)
+
+    foreign_key, = column.foreign_keys
+    assert foreign_key.column is Base.metadata.tables["todos"].c.id
+    assert foreign_key.ondelete == "CASCADE"
 
 
 def test_media_columns_are_required():
@@ -65,6 +77,26 @@ def test_asset_can_be_instantiated_with_its_metadata():
     )
 
     assert asset.user_id == user_id
+    assert asset.todo_id is None
+    assert asset.gcs_path == "uploads/cat.png"
+    assert asset.public_url == "https://storage.googleapis.com/bucket/uploads/cat.png"
+    assert asset.media_type == "image/png"
+
+
+def test_asset_can_be_instantiated_with_todo_id():
+    user_id = uuid.uuid4()
+    todo_id = uuid.uuid4()
+
+    asset = Asset(
+        user_id=user_id,
+        todo_id=todo_id,
+        gcs_path="uploads/cat.png",
+        public_url="https://storage.googleapis.com/bucket/uploads/cat.png",
+        media_type="image/png",
+    )
+
+    assert asset.user_id == user_id
+    assert asset.todo_id == todo_id
     assert asset.gcs_path == "uploads/cat.png"
     assert asset.public_url == "https://storage.googleapis.com/bucket/uploads/cat.png"
     assert asset.media_type == "image/png"
