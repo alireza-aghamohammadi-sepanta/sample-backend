@@ -5,8 +5,11 @@ so the suite stays runnable without a database service.
 """
 
 import uuid
+from pathlib import Path
 
 import sqlalchemy as sa
+from alembic import command
+from alembic.config import Config
 
 from app.db import Base
 from app.models import Asset
@@ -68,3 +71,33 @@ def test_asset_can_be_instantiated_with_its_metadata():
     assert asset.gcs_path == "uploads/cat.png"
     assert asset.public_url == "https://storage.googleapis.com/bucket/uploads/cat.png"
     assert asset.media_type == "image/png"
+
+
+def test_migration_004_applies_cleanly(tmp_path, monkeypatch):
+    """Verify that migration revision 004 applies cleanly to the test database schema without errors."""
+    config = Config(str(Path(__file__).parent / "alembic.ini"))
+    db_file = tmp_path / "test_migration.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+pysqlite:///{db_file}")
+
+    command.upgrade(config, "004")
+
+    engine = sa.create_engine(f"sqlite+pysqlite:///{db_file}")
+    try:
+        inspector = sa.inspect(engine)
+        assert "assets" in inspector.get_table_names()
+        columns = {col["name"]: col for col in inspector.get_columns("assets")}
+        assert {"id", "user_id", "gcs_path", "public_url", "media_type", "created_at"} <= set(columns.keys())
+        assert columns["gcs_path"]["nullable"] is False
+        assert columns["public_url"]["nullable"] is False
+        assert columns["media_type"]["nullable"] is False
+        assert columns["created_at"]["nullable"] is False
+
+        indexes = inspector.get_indexes("assets")
+        user_id_indexes = [idx for idx in indexes if idx["column_names"] == ["user_id"]]
+        assert len(user_id_indexes) == 1
+
+        command.downgrade(config, "003")
+        inspector = sa.inspect(engine)
+        assert "assets" not in inspector.get_table_names()
+    finally:
+        engine.dispose()
