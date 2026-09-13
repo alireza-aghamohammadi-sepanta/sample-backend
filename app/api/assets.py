@@ -15,8 +15,10 @@ and turn a refusal into a status code.
 """
 
 import uuid
+from collections.abc import Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.security import current_user
@@ -31,6 +33,7 @@ from app.schemas.asset import (
 from app.services.storage import StorageService, get_storage_service
 
 router = APIRouter(prefix="/assets", tags=["assets"])
+assets_router = router
 
 # One message for every rejected key, whatever is wrong with it: whether a
 # given object exists under someone else's prefix is not something a caller
@@ -95,3 +98,18 @@ def confirm_upload(
     db.commit()
     db.refresh(asset)
     return asset
+
+
+@router.get("", response_model=list[AssetResponse], status_code=status.HTTP_200_OK)
+@router.get("/", response_model=list[AssetResponse], status_code=status.HTTP_200_OK, include_in_schema=False)
+def list_assets(
+    user_id: uuid.UUID = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> Sequence[Asset]:
+    """List all assets belonging to the authenticated user ordered by created_at ascending."""
+    stmt = (
+        select(Asset)
+        .where(Asset.user_id == user_id)
+        .order_by(Asset.created_at.asc())
+    )
+    return db.scalars(stmt).all()

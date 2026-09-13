@@ -17,7 +17,7 @@ cover the provider itself.
 """
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import sqlalchemy as sa
@@ -53,6 +53,8 @@ BUCKET = "sample-media"
 SIGNED_URL_PATH = "/assets/signed-url"
 
 CONFIRM_PATH = "/assets/confirm"
+
+ASSETS_PATH = "/assets"
 
 
 class FakeBlob:
@@ -725,3 +727,162 @@ def test_endpoints_fail_loudly_without_a_storage_service(
     assert response.status_code == 500
     assert response.json()["detail"] == STORAGE_UNAVAILABLE_DETAIL
     assert stored_assets(db_session) == []
+
+
+# --- GET /assets endpoint ---------------------------------------------------
+
+
+def test_list_assets_route_is_registered():
+    paths = app.openapi()["paths"]
+    assert ASSETS_PATH in paths
+    assert "get" in paths[ASSETS_PATH]
+
+
+def test_list_assets_unauthenticated(confirm_client):
+    """GET /assets without Authorization header returns 401 Unauthorized."""
+    response = confirm_client.get(ASSETS_PATH)
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Could not validate credentials"
+
+
+def test_list_assets_invalid_token(confirm_client):
+    """GET /assets with an invalid token returns 401 Unauthorized."""
+    response = confirm_client.get(
+        ASSETS_PATH, headers={"Authorization": "Bearer not-a-valid-jwt-token"}
+    )
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Could not validate credentials"
+
+
+def test_list_assets_expired_token(confirm_client, registered_user):
+    """GET /assets with an expired token returns 401 Unauthorized."""
+    token = create_access_token(
+        registered_user, expires_delta=timedelta(minutes=-5)
+    )
+    response = confirm_client.get(
+        ASSETS_PATH, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Could not validate credentials"
+
+
+def test_list_assets_empty(confirm_client, registered_user):
+    """Listing assets when user has none returns an empty list with 200 OK."""
+    response = confirm_client.get(
+        ASSETS_PATH, headers=auth_headers(registered_user)
+    )
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_list_assets_returns_assets_ordered_by_created_at(
+    confirm_client, registered_user, db_session
+):
+    """Listing assets returns assets belonging to user ordered by created_at ascending."""
+    base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    asset_middle = Asset(
+        id=uuid.uuid4(),
+        user_id=registered_user,
+        gcs_path=f"users/{registered_user}/image/2.png",
+        public_url=f"https://storage.googleapis.com/sample-media/users/{registered_user}/image/2.png",
+        media_type="image",
+        created_at=base_time + timedelta(hours=1),
+    )
+    asset_earliest = Asset(
+        id=uuid.uuid4(),
+        user_id=registered_user,
+        gcs_path=f"users/{registered_user}/image/1.png",
+        public_url=f"https://storage.googleapis.com/sample-media/users/{registered_user}/image/1.png",
+        media_type="image",
+        created_at=base_time,
+    )
+    asset_latest = Asset(
+        id=uuid.uuid4(),
+        user_id=registered_user,
+        gcs_path=f"users/{registered_user}/video/3.mp4",
+        public_url=f"https://storage.googleapis.com/sample-media/users/{registered_user}/video/3.mp4",
+        media_type="video",
+        created_at=base_time + timedelta(hours=2),
+    )
+
+    # Insert out of order
+    db_session.add_all([asset_middle, asset_earliest, asset_latest])
+    db_session.commit()
+
+    response = confirm_client.get(
+        ASSETS_PATH, headers=auth_headers(registered_user)
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) == 3
+
+    # Check ordering is by created_at ascending
+    assert data[0]["id"] == str(asset_earliest.id)
+    assert data[1]["id"] == str(asset_middle.id)
+    assert data[2]["id"] == str(asset_latest.id)
+
+    # Verify response schema fields
+    assert data[0]["user_id"] == str(registered_user)
+    assert data[0]["gcs_path"] == f"users/{registered_user}/image/1.png"
+    assert data[0]["public_url"] == f"https://storage.googleapis.com/sample-media/users/{registered_user}/image/1.png"
+    assert data[0]["media_type"] == "image"
+    assert "created_at" in data[0]
+
+
+def test_list_assets_multi_tenant_isolation(
+    confirm_client, registered_user, db_session
+):
+    """Users cannot see each other's assets."""
+    other_user_id = uuid.uuid4()
+    db_session.add(
+        User(
+            id=other_user_id,
+            email=f"{other_user_id}@example.test",
+            hashed_password="not-a-real-hash",
+        )
+    )
+    asset_user1 = Asset(
+        id=uuid.uuid4(),
+        user_id=registered_user,
+        gcs_path=f"users/{registered_user}/image/u1.png",
+        public_url=f"https://storage.googleapis.com/sample-media/users/{registered_user}/image/u1.png",
+        media_type="image",
+    )
+    asset_user2 = Asset(
+        id=uuid.uuid4(),
+        user_id=other_user_id,
+        gcs_path=f"users/{other_user_id}/image/u2.png",
+        public_url=f"https://storage.googleapis.com/sample-media/users/{other_user_id}/image/u2.png",
+        media_type="image",
+    )
+    db_session.add_all([asset_user1, asset_user2])
+    db_session.commit()
+
+    # User 1 should only see user 1's asset
+    response1 = confirm_client.get(
+        ASSETS_PATH, headers=auth_headers(registered_user)
+    )
+    assert response1.status_code == 200
+    data1 = response1.json()
+    assert len(data1) == 1
+    assert data1[0]["id"] == str(asset_user1.id)
+    assert data1[0]["user_id"] == str(registered_user)
+
+    # User 2 should only see user 2's asset
+    response2 = confirm_client.get(
+        ASSETS_PATH, headers=auth_headers(other_user_id)
+    )
+    assert response2.status_code == 200
+    data2 = response2.json()
+    assert len(data2) == 1
+    assert data2[0]["id"] == str(asset_user2.id)
+    assert data2[0]["user_id"] == str(other_user_id)
+
+
+def test_list_assets_trailing_slash(confirm_client, registered_user):
+    """GET /assets/ with trailing slash works properly."""
+    response = confirm_client.get(
+        f"{ASSETS_PATH}/", headers=auth_headers(registered_user)
+    )
+    assert response.status_code == 200
+    assert response.json() == []
