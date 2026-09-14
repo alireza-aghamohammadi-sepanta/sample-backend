@@ -18,7 +18,7 @@ from app.core.config import get_settings
 from app.core.security import create_access_token
 from app.db import Base
 from app.db.session import get_db
-from app.models import Todo, User
+from app.models import Asset, Todo, User
 from main import app
 
 ENV_VARS = (
@@ -116,6 +116,34 @@ def other_auth_headers(other_registered_user) -> dict[str, str]:
     """Authorization header with a valid bearer token for other_registered_user."""
     token = create_access_token(other_registered_user)
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def user_asset(db_session, user_id) -> Asset:
+    """An asset owned by the registered user."""
+    asset = Asset(
+        user_id=user_id,
+        gcs_path=f"users/{user_id}/image/{uuid.uuid4()}.png",
+        public_url="https://storage.googleapis.com/bucket/test.png",
+        media_type="image",
+    )
+    db_session.add(asset)
+    db_session.commit()
+    return asset
+
+
+@pytest.fixture
+def other_user_asset(db_session, other_user_id) -> Asset:
+    """An asset owned by another user."""
+    asset = Asset(
+        user_id=other_user_id,
+        gcs_path=f"users/{other_user_id}/image/{uuid.uuid4()}.png",
+        public_url="https://storage.googleapis.com/bucket/other.png",
+        media_type="image",
+    )
+    db_session.add(asset)
+    db_session.commit()
+    return asset
 
 
 # --- POST /todos tests ---
@@ -216,6 +244,123 @@ def test_create_todo_empty_body(client, auth_headers):
     response = client.post("/todos", json={}, headers=auth_headers)
 
     assert response.status_code == 422
+
+
+# --- AC-1: create todo with asset_ids ---
+
+
+def test_create_todo_with_asset_ids(client, auth_headers, user_id, user_asset, db_session):
+    """Creating a todo with asset_ids associates user-owned assets and returns them (AC-1)."""
+    payload = {
+        "title": "Todo with an attachment",
+        "description": "See attached image",
+        "asset_ids": [str(user_asset.id)],
+    }
+    response = client.post("/todos", json=payload, headers=auth_headers)
+
+    assert response.status_code == 201
+    data = response.json()
+    assert data["title"] == "Todo with an attachment"
+    assert "assets" in data
+    assert len(data["assets"]) == 1
+    assert data["assets"][0]["id"] == str(user_asset.id)
+    assert data["assets"][0]["gcs_path"] == user_asset.gcs_path
+    assert data["assets"][0]["public_url"] == user_asset.public_url
+    assert data["assets"][0]["media_type"] == user_asset.media_type
+    assert data["assets"][0]["user_id"] == str(user_id)
+
+    # Verify persisted relationship in database
+    todo_id = uuid.UUID(data["id"])
+    persisted = db_session.get(Todo, todo_id)
+    assert persisted is not None
+    assert len(persisted.assets) == 1
+    assert persisted.assets[0].id == user_asset.id
+
+
+def test_create_todo_with_multiple_asset_ids(client, auth_headers, user_id, db_session):
+    """Creating a todo with multiple user-owned asset_ids associates all of them (AC-1)."""
+    asset1 = Asset(
+        user_id=user_id,
+        gcs_path=f"users/{user_id}/image/{uuid.uuid4()}.png",
+        public_url="https://storage.googleapis.com/bucket/1.png",
+        media_type="image",
+    )
+    asset2 = Asset(
+        user_id=user_id,
+        gcs_path=f"users/{user_id}/video/{uuid.uuid4()}.mp4",
+        public_url="https://storage.googleapis.com/bucket/2.mp4",
+        media_type="video",
+    )
+    db_session.add_all([asset1, asset2])
+    db_session.commit()
+
+    payload = {
+        "title": "Todo with multiple assets",
+        "asset_ids": [str(asset1.id), str(asset2.id)],
+    }
+    response = client.post("/todos", json=payload, headers=auth_headers)
+
+    assert response.status_code == 201
+    data = response.json()
+    assert len(data["assets"]) == 2
+    returned_ids = {a["id"] for a in data["assets"]}
+    assert returned_ids == {str(asset1.id), str(asset2.id)}
+
+
+def test_create_todo_asset_ids_max_length_exceeded(client, auth_headers):
+    """Creating a todo with more than 10 asset_ids returns 422 Unprocessable Entity (AC-1)."""
+    payload = {
+        "title": "Too many assets",
+        "asset_ids": [str(uuid.uuid4()) for _ in range(11)],
+    }
+    response = client.post("/todos", json=payload, headers=auth_headers)
+
+    assert response.status_code == 422
+
+
+def test_create_todo_only_attaches_user_owned_assets(
+    client, auth_headers, user_id, user_asset, other_user_asset, db_session
+):
+    """Creating a todo with an asset owned by another user ignores the unowned asset (AC-1)."""
+    payload = {
+        "title": "Todo with mixed assets",
+        "asset_ids": [str(user_asset.id), str(other_user_asset.id)],
+    }
+    response = client.post("/todos", json=payload, headers=auth_headers)
+
+    assert response.status_code == 201
+    data = response.json()
+    assert len(data["assets"]) == 1
+    assert data["assets"][0]["id"] == str(user_asset.id)
+
+    # Database verify
+    todo_id = uuid.UUID(data["id"])
+    persisted = db_session.get(Todo, todo_id)
+    assert len(persisted.assets) == 1
+    assert persisted.assets[0].id == user_asset.id
+
+
+def test_create_todo_with_nonexistent_asset_id(client, auth_headers, user_id, db_session):
+    """Creating a todo with a non-existent asset_id results in no attached assets."""
+    payload = {
+        "title": "Todo with missing asset",
+        "asset_ids": [str(uuid.uuid4())],
+    }
+    response = client.post("/todos", json=payload, headers=auth_headers)
+
+    assert response.status_code == 201
+    data = response.json()
+    assert data["assets"] == []
+
+
+def test_create_todo_without_asset_ids_defaults_to_empty(client, auth_headers):
+    """Creating a todo without asset_ids returns empty assets list."""
+    payload = {"title": "Todo without assets"}
+    response = client.post("/todos", json=payload, headers=auth_headers)
+
+    assert response.status_code == 201
+    data = response.json()
+    assert data["assets"] == []
 
 
 # --- GET /todos tests ---
@@ -366,6 +511,85 @@ def test_get_todo_invalid_token(client):
 
     assert response.status_code == 401
     assert response.json() == {"detail": "Could not validate credentials"}
+
+
+# --- AC-2: retrieve todo with attached assets ---
+
+
+def test_get_todo_with_attached_assets(
+    client, auth_headers, user_id, user_asset, db_session
+):
+    """Retrieving a single todo returns attached assets (AC-2)."""
+    todo = Todo(
+        user_id=user_id,
+        title="Todo with Asset",
+        description="Inspect details",
+        is_completed=False,
+    )
+    todo.assets.append(user_asset)
+    db_session.add(todo)
+    db_session.commit()
+
+    response = client.get(f"/todos/{todo.id}", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == str(todo.id)
+    assert "assets" in data
+    assert len(data["assets"]) == 1
+    assert data["assets"][0]["id"] == str(user_asset.id)
+    assert data["assets"][0]["gcs_path"] == user_asset.gcs_path
+    assert data["assets"][0]["public_url"] == user_asset.public_url
+    assert data["assets"][0]["media_type"] == user_asset.media_type
+
+
+def test_get_todo_without_assets_returns_empty_list(
+    client, auth_headers, user_id, db_session
+):
+    """Retrieving a todo without attached assets returns an empty assets list (AC-2)."""
+    todo = Todo(
+        user_id=user_id,
+        title="Todo without Asset",
+        description="No assets",
+    )
+    db_session.add(todo)
+    db_session.commit()
+
+    response = client.get(f"/todos/{todo.id}", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["assets"] == []
+
+
+def test_list_todos_includes_attached_assets(
+    client, auth_headers, user_id, user_asset, db_session
+):
+    """Listing todos returns attached assets for each todo (AC-2)."""
+    todo1 = Todo(
+        user_id=user_id,
+        title="Todo with asset",
+        description="First",
+    )
+    todo1.assets.append(user_asset)
+
+    todo2 = Todo(
+        user_id=user_id,
+        title="Todo without asset",
+        description="Second",
+    )
+    db_session.add_all([todo1, todo2])
+    db_session.commit()
+
+    response = client.get("/todos", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) == 2
+    by_title = {t["title"]: t for t in data}
+    assert len(by_title["Todo with asset"]["assets"]) == 1
+    assert by_title["Todo with asset"]["assets"][0]["id"] == str(user_asset.id)
+    assert by_title["Todo without asset"]["assets"] == []
 
 
 # --- PATCH /todos/{todo_id} tests ---

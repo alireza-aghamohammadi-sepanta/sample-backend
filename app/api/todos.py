@@ -10,10 +10,11 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.security import current_user
 from app.db.session import get_db
+from app.models.asset import Asset
 from app.models.todo import Todo
 from app.schemas.todo import TodoCreate, TodoRead, TodoUpdate
 
@@ -35,10 +36,25 @@ def create_todo(
         title=payload.title,
         description=payload.description,
     )
+    if payload.asset_ids:
+        stmt = (
+            select(Asset)
+            .where(
+                Asset.id.in_(payload.asset_ids),
+                Asset.user_id == user_id,
+            )
+        )
+        todo.assets = list(db.scalars(stmt).all())
+
     db.add(todo)
     db.commit()
-    db.refresh(todo)
-    return todo
+
+    stmt = (
+        select(Todo)
+        .where(Todo.id == todo.id, Todo.user_id == user_id)
+        .options(selectinload(Todo.assets))
+    )
+    return db.scalar(stmt)  # type: ignore[return-value]
 
 
 @router.get("", response_model=list[TodoRead], status_code=status.HTTP_200_OK)
@@ -48,7 +64,12 @@ def list_todos(
     db: Session = Depends(get_db),
 ) -> Sequence[Todo]:
     """List all todo items belonging to the authenticated user."""
-    stmt = select(Todo).where(Todo.user_id == user_id).order_by(Todo.created_at.asc())
+    stmt = (
+        select(Todo)
+        .where(Todo.user_id == user_id)
+        .options(selectinload(Todo.assets))
+        .order_by(Todo.created_at.asc())
+    )
     return db.scalars(stmt).all()
 
 
@@ -59,7 +80,11 @@ def get_todo(
     db: Session = Depends(get_db),
 ) -> Todo:
     """Retrieve a single todo item belonging to the authenticated user."""
-    stmt = select(Todo).where(Todo.id == todo_id, Todo.user_id == user_id)
+    stmt = (
+        select(Todo)
+        .where(Todo.id == todo_id, Todo.user_id == user_id)
+        .options(selectinload(Todo.assets))
+    )
     todo = db.scalar(stmt)
     if todo is None:
         raise HTTPException(
@@ -111,4 +136,3 @@ def delete_todo(
     db.delete(todo)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
-

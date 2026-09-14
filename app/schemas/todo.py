@@ -5,8 +5,11 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.asset import AssetResponse
+
 MAX_TITLE_LENGTH = 255
 MAX_DESCRIPTION_LENGTH = 1024
+MAX_ASSETS_PER_TODO = 10
 
 
 class TodoBase(BaseModel):
@@ -18,6 +21,11 @@ class TodoBase(BaseModel):
 
 class TodoCreate(TodoBase):
     """Payload for creating a new todo item."""
+
+    asset_ids: list[uuid.UUID] | None = Field(
+        default=None,
+        max_length=MAX_ASSETS_PER_TODO,
+    )
 
 
 class TodoUpdate(BaseModel):
@@ -38,3 +46,4 @@ class TodoRead(TodoBase):
     is_completed: bool
     created_at: datetime
     updated_at: datetime
+    assets: list[AssetResponse] = Field(default_factory=list)
