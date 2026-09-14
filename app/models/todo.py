@@ -2,11 +2,32 @@
 
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Uuid, func
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, String, Table, Uuid, func
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
+
+if TYPE_CHECKING:
+    from app.models.asset import Asset
+
+todo_assets = Table(
+    "todo_assets",
+    Base.metadata,
+    Column(
+        "todo_id",
+        Uuid(as_uuid=True),
+        ForeignKey("todos.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "asset_id",
+        Uuid(as_uuid=True),
+        ForeignKey("assets.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+)
 
 
 class Todo(Base):
@@ -49,6 +70,12 @@ class Todo(Base):
         nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
+    )
+
+    assets: Mapped[list["Asset"]] = relationship(
+        "Asset",
+        secondary="todo_assets",
+        back_populates="todos",
     )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
