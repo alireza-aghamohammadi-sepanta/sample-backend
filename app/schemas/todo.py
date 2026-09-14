@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.asset import AssetResponse
 
@@ -27,6 +27,15 @@ class TodoCreate(TodoBase):
         max_length=MAX_ASSETS_PER_TODO,
     )
 
+    @field_validator("asset_ids", mode="after")
+    @classmethod
+    def _deduplicate_asset_ids(
+        cls, v: list[uuid.UUID] | None
+    ) -> list[uuid.UUID] | None:
+        if v is None:
+            return None
+        return list(dict.fromkeys(v))
+
 
 class TodoUpdate(BaseModel):
     """Payload for updating an existing todo item."""
@@ -34,6 +43,19 @@ class TodoUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=MAX_TITLE_LENGTH)
     description: str | None = Field(default=None, max_length=MAX_DESCRIPTION_LENGTH)
     is_completed: bool | None = None
+    asset_ids: list[uuid.UUID] | None = Field(
+        default=None,
+        max_length=MAX_ASSETS_PER_TODO,
+    )
+
+    @field_validator("asset_ids", mode="after")
+    @classmethod
+    def _deduplicate_asset_ids(
+        cls, v: list[uuid.UUID] | None
+    ) -> list[uuid.UUID] | None:
+        if v is None:
+            return None
+        return list(dict.fromkeys(v))
 
 
 class TodoRead(TodoBase):

@@ -21,6 +21,33 @@ from app.schemas.todo import TodoCreate, TodoRead, TodoUpdate
 router = APIRouter(prefix="/todos", tags=["todos"])
 
 TODO_NOT_FOUND_DETAIL = "Todo not found"
+INVALID_ASSET_IDS_DETAIL = "Invalid asset IDs"
+
+
+def _validate_and_get_assets(
+    db: Session,
+    asset_ids: list[uuid.UUID],
+    user_id: uuid.UUID,
+) -> list[Asset]:
+    """Validate that all asset IDs exist and belong to the user, returning them in order."""
+    unique_ids = list(dict.fromkeys(asset_ids))
+    if not unique_ids:
+        return []
+    stmt = (
+        select(Asset)
+        .where(
+            Asset.id.in_(unique_ids),
+            Asset.user_id == user_id,
+        )
+    )
+    found_assets = list(db.scalars(stmt).all())
+    if len(found_assets) != len(unique_ids):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=INVALID_ASSET_IDS_DETAIL,
+        )
+    assets_by_id = {asset.id: asset for asset in found_assets}
+    return [assets_by_id[aid] for aid in unique_ids]
 
 
 @router.post("", response_model=TodoRead, status_code=status.HTTP_201_CREATED)
@@ -37,14 +64,7 @@ def create_todo(
         description=payload.description,
     )
     if payload.asset_ids:
-        stmt = (
-            select(Asset)
-            .where(
-                Asset.id.in_(payload.asset_ids),
-                Asset.user_id == user_id,
-            )
-        )
-        todo.assets = list(db.scalars(stmt).all())
+        todo.assets = _validate_and_get_assets(db, payload.asset_ids, user_id)
 
     db.add(todo)
     db.commit()
@@ -102,7 +122,11 @@ def update_todo(
     db: Session = Depends(get_db),
 ) -> Todo:
     """Partially update a todo item belonging to the authenticated user."""
-    stmt = select(Todo).where(Todo.id == todo_id, Todo.user_id == user_id)
+    stmt = (
+        select(Todo)
+        .where(Todo.id == todo_id, Todo.user_id == user_id)
+        .options(selectinload(Todo.assets))
+    )
     todo = db.scalar(stmt)
     if todo is None:
         raise HTTPException(
@@ -110,12 +134,25 @@ def update_todo(
             detail=TODO_NOT_FOUND_DETAIL,
         )
 
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    update_data = payload.model_dump(exclude_unset=True)
+    if "asset_ids" in update_data:
+        asset_ids = update_data.pop("asset_ids")
+        if asset_ids:
+            todo.assets = _validate_and_get_assets(db, asset_ids, user_id)
+        else:
+            todo.assets = []
+
+    for field, value in update_data.items():
         setattr(todo, field, value)
     todo.updated_at = datetime.now(timezone.utc)
     db.commit()
-    db.refresh(todo)
-    return todo
+
+    stmt = (
+        select(Todo)
+        .where(Todo.id == todo.id, Todo.user_id == user_id)
+        .options(selectinload(Todo.assets))
+    )
+    return db.scalar(stmt)  # type: ignore[return-value]
 
 
 @router.delete("/{todo_id}", status_code=status.HTTP_204_NO_CONTENT)
