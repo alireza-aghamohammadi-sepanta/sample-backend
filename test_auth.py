@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 from app.core import security
 from app.core.config import get_settings
 from app.db.session import get_db
-from app.models import PasswordResetToken, User
+from app.models import PasswordResetToken, TodoList, User
 from app.schemas.user import (
     ForgotPasswordRequest,
     ResetPasswordRequest,
@@ -205,6 +205,25 @@ def test_signup_persists_the_user_row(client, db_session):
 
 
 @requires_database
+def test_signup_provisions_default_inbox_list(client, db_session):
+    response = client.post(
+        "/signup",
+        json={"email": "alice@example.com", "password": "correct-horse-battery"},
+    )
+    assert response.status_code == 201
+
+    user = db_session.execute(sa.select(User)).scalar_one()
+    todo_list = db_session.execute(
+        sa.select(TodoList).where(TodoList.user_id == user.id)
+    ).scalar_one()
+
+    assert todo_list.name == "Inbox"
+    assert todo_list.is_default is True
+    assert todo_list.created_at is not None
+    assert todo_list.updated_at is not None
+
+
+@requires_database
 def test_signup_normalises_the_email(client, db_session):
     response = client.post(
         "/signup",
@@ -316,6 +335,9 @@ class LosingRaceSession:
 
     def add(self, instance):
         self.added = instance
+
+    def flush(self):
+        pass
 
     def commit(self):
         raise IntegrityError(

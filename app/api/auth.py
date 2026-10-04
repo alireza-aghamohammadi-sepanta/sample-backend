@@ -6,6 +6,7 @@ into a plain message so no SQL or driver detail reaches the client.
 """
 
 from datetime import datetime, timedelta, timezone
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -21,6 +22,7 @@ from app.core.security import (
 )
 from app.db.session import get_db
 from app.models.password_reset_token import PasswordResetToken
+from app.models.todo_list import TodoList
 from app.models.user import User
 from app.schemas.user import (
     ForgotPasswordRequest,
@@ -53,9 +55,20 @@ def signup(payload: UserCreate, db: Session = Depends(get_db)) -> Token:
             status_code=status.HTTP_409_CONFLICT, detail=EMAIL_TAKEN_DETAIL
         )
 
-    user = User(email=email, hashed_password=get_password_hash(payload.password))
+    user = User(
+        email=email,
+        hashed_password=get_password_hash(payload.password),
+    )
     db.add(user)
     try:
+        if hasattr(db, "flush"):
+            db.flush()
+        default_list = TodoList(
+            user_id=user.id,
+            name="Inbox",
+            is_default=True,
+        )
+        db.add(default_list)
         db.commit()
     except IntegrityError:
         # Another request registered the same address between the lookup and

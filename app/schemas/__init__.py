@@ -13,6 +13,11 @@ from app.schemas.todo import (
     TodoRead,
     TodoUpdate,
 )
+from app.schemas.todo_list import (
+    TodoListCreate,
+    TodoListRead,
+    TodoListUpdate,
+)
 from app.schemas.user import Token, UserCreate, UserLogin, UserRead
 
 __all__ = [
@@ -25,6 +30,9 @@ __all__ = [
     "TodoCreate",
     "TodoRead",
     "TodoUpdate",
+    "TodoListCreate",
+    "TodoListRead",
+    "TodoListUpdate",
     "Token",
     "UserCreate",
     "UserLogin",

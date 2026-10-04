@@ -18,7 +18,7 @@ from app.core.config import get_settings
 from app.core.security import create_access_token
 from app.db import Base
 from app.db.session import get_db
-from app.models import Asset, Todo, User
+from app.models import Asset, Todo, TodoList, User
 from app.models.todo import todo_assets
 from main import app
 
@@ -83,6 +83,7 @@ def registered_user(db_session, user_id) -> uuid.UUID:
         hashed_password="not-a-real-hash",
     )
     db_session.add(user)
+    db_session.add(TodoList(user_id=user_id, name="Inbox", is_default=True))
     db_session.commit()
     return user_id
 
@@ -92,6 +93,16 @@ def auth_headers(registered_user) -> dict[str, str]:
     """Authorization header with a valid bearer token for registered_user."""
     token = create_access_token(registered_user)
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def default_list_id(db_session, registered_user) -> uuid.UUID:
+    """The default list ID for registered_user."""
+    stmt = sa.select(TodoList.id).where(
+        TodoList.user_id == registered_user,
+        TodoList.is_default == True,  # noqa: E712
+    )
+    return db_session.scalar(stmt)
 
 
 @pytest.fixture
@@ -108,6 +119,7 @@ def other_registered_user(db_session, other_user_id) -> uuid.UUID:
         hashed_password="not-a-real-hash",
     )
     db_session.add(user)
+    db_session.add(TodoList(user_id=other_user_id, name="Inbox", is_default=True))
     db_session.commit()
     return other_user_id
 
@@ -117,6 +129,42 @@ def other_auth_headers(other_registered_user) -> dict[str, str]:
     """Authorization header with a valid bearer token for other_registered_user."""
     token = create_access_token(other_registered_user)
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def other_default_list_id(db_session, other_registered_user) -> uuid.UUID:
+    """The default list ID for other_registered_user."""
+    stmt = sa.select(TodoList.id).where(
+        TodoList.user_id == other_registered_user,
+        TodoList.is_default == True,  # noqa: E712
+    )
+    return db_session.scalar(stmt)
+
+
+@pytest.fixture(autouse=True)
+def _auto_assign_list_id(db_session):
+    @sa.event.listens_for(Todo, "before_insert")
+    def receive_before_insert(mapper, connection, target):
+        if target.list_id is None and target.user_id is not None:
+            stmt = sa.select(TodoList.id).where(
+                TodoList.user_id == target.user_id,
+                TodoList.is_default == True,  # noqa: E712
+            )
+            inbox_id = connection.scalar(stmt)
+            if inbox_id is None:
+                inbox_id = uuid.uuid4()
+                connection.execute(
+                    sa.insert(TodoList).values(
+                        id=inbox_id,
+                        user_id=target.user_id,
+                        name="Inbox",
+                        is_default=True,
+                    )
+                )
+            target.list_id = inbox_id
+
+    yield
+    sa.event.remove(Todo, "before_insert", receive_before_insert)
 
 
 @pytest.fixture
@@ -1251,4 +1299,186 @@ def test_delete_todo_preserves_asset_attached_to_another_todo(
 
     # Asset still exists
     assert db_session.get(Asset, user_asset.id) is not None
+
+
+# --- List Assignment, Reassignment, and Filtering Tests ---
+
+
+def test_create_todo_defaults_list_id_to_default_list(
+    client, auth_headers, default_list_id
+):
+    """Creating a todo without list_id assigns it to the user's default list."""
+    response = client.post(
+        "/todos",
+        json={"title": "Default list task"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert "list_id" in data
+    assert data["list_id"] == str(default_list_id)
+
+
+def test_create_todo_with_explicit_list_id(
+    client, auth_headers, user_id, db_session
+):
+    """Creating a todo with explicit list_id assigns it to that list."""
+    custom_list = TodoList(user_id=user_id, name="Custom", is_default=False)
+    db_session.add(custom_list)
+    db_session.commit()
+
+    response = client.post(
+        "/todos",
+        json={"title": "Custom list task", "list_id": str(custom_list.id)},
+        headers=auth_headers,
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["list_id"] == str(custom_list.id)
+
+
+def test_create_todo_rejects_foreign_user_list_id(
+    client, auth_headers, other_default_list_id
+):
+    """Creating a todo with another user's list_id returns 404 Not Found."""
+    response = client.post(
+        "/todos",
+        json={"title": "Foreign list task", "list_id": str(other_default_list_id)},
+        headers=auth_headers,
+    )
+    assert response.status_code == 404
+
+
+def test_create_todo_rejects_nonexistent_list_id(client, auth_headers):
+    """Creating a todo with nonexistent list_id returns 404 Not Found."""
+    fake_id = uuid.uuid4()
+    response = client.post(
+        "/todos",
+        json={"title": "Nonexistent list task", "list_id": str(fake_id)},
+        headers=auth_headers,
+    )
+    assert response.status_code == 404
+
+
+def test_patch_todo_move_to_another_list(
+    client, auth_headers, user_id, default_list_id, db_session
+):
+    """Moving a task between user lists updates the todo's list_id."""
+    custom_list = TodoList(user_id=user_id, name="Projects", is_default=False)
+    db_session.add(custom_list)
+    db_session.commit()
+
+    create_res = client.post(
+        "/todos",
+        json={"title": "Movable task"},
+        headers=auth_headers,
+    )
+    assert create_res.status_code == 201
+    todo_id = create_res.json()["id"]
+
+    patch_res = client.patch(
+        f"/todos/{todo_id}",
+        json={"list_id": str(custom_list.id)},
+        headers=auth_headers,
+    )
+    assert patch_res.status_code == 200
+    assert patch_res.json()["list_id"] == str(custom_list.id)
+
+    persisted = db_session.get(Todo, uuid.UUID(todo_id))
+    assert persisted.list_id == custom_list.id
+
+
+def test_patch_todo_rejects_foreign_user_list_id(
+    client, auth_headers, user_id, default_list_id, other_default_list_id, db_session
+):
+    """Moving a task to another user's list returns 404 and does not modify the todo."""
+    todo = Todo(
+        user_id=user_id,
+        list_id=default_list_id,
+        title="Stay put",
+    )
+    db_session.add(todo)
+    db_session.commit()
+
+    patch_res = client.patch(
+        f"/todos/{todo.id}",
+        json={"list_id": str(other_default_list_id)},
+        headers=auth_headers,
+    )
+    assert patch_res.status_code == 404
+
+    db_session.refresh(todo)
+    assert todo.list_id == default_list_id
+
+
+def test_patch_todo_rejects_nonexistent_list_id(
+    client, auth_headers, user_id, default_list_id, db_session
+):
+    """Moving a task to a nonexistent list returns 404 and does not modify the todo."""
+    todo = Todo(
+        user_id=user_id,
+        list_id=default_list_id,
+        title="Stay put",
+    )
+    db_session.add(todo)
+    db_session.commit()
+
+    fake_id = uuid.uuid4()
+    patch_res = client.patch(
+        f"/todos/{todo.id}",
+        json={"list_id": str(fake_id)},
+        headers=auth_headers,
+    )
+    assert patch_res.status_code == 404
+
+    db_session.refresh(todo)
+    assert todo.list_id == default_list_id
+
+
+def test_list_todos_filter_by_list_id(
+    client, auth_headers, user_id, default_list_id, other_default_list_id, db_session
+):
+    """Filtering GET /todos?list_id=... returns only todos belonging to that list."""
+    list1 = TodoList(user_id=user_id, name="List 1", is_default=False)
+    list2 = TodoList(user_id=user_id, name="List 2", is_default=False)
+    db_session.add_all([list1, list2])
+    db_session.commit()
+
+    t_default = Todo(user_id=user_id, list_id=default_list_id, title="Default item")
+    t_list1 = Todo(user_id=user_id, list_id=list1.id, title="List 1 item")
+    t_list2 = Todo(user_id=user_id, list_id=list2.id, title="List 2 item")
+    db_session.add_all([t_default, t_list1, t_list2])
+    db_session.commit()
+
+    # Filter list 1
+    res1 = client.get(f"/todos?list_id={list1.id}", headers=auth_headers)
+    assert res1.status_code == 200
+    items1 = res1.json()
+    assert len(items1) == 1
+    assert items1[0]["title"] == "List 1 item"
+
+    # Filter list 2
+    res2 = client.get(f"/todos?list_id={list2.id}", headers=auth_headers)
+    assert res2.status_code == 200
+    items2 = res2.json()
+    assert len(items2) == 1
+    assert items2[0]["title"] == "List 2 item"
+
+    # Filter default list
+    res_def = client.get(f"/todos?list_id={default_list_id}", headers=auth_headers)
+    assert res_def.status_code == 200
+    items_def = res_def.json()
+    assert len(items_def) == 1
+    assert items_def[0]["title"] == "Default item"
+
+    # Filter other user's list -> returns empty list
+    res_other = client.get(f"/todos?list_id={other_default_list_id}", headers=auth_headers)
+    assert res_other.status_code == 200
+    assert res_other.json() == []
+
+    # No filter -> returns all user todos
+    res_all = client.get("/todos", headers=auth_headers)
+    assert res_all.status_code == 200
+    assert len(res_all.json()) == 3
+
 

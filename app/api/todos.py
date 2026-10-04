@@ -16,11 +16,13 @@ from app.core.security import current_user
 from app.db.session import get_db
 from app.models.asset import Asset
 from app.models.todo import Todo
+from app.models.todo_list import TodoList
 from app.schemas.todo import TodoCreate, TodoRead, TodoUpdate
 
 router = APIRouter(prefix="/todos", tags=["todos"])
 
 TODO_NOT_FOUND_DETAIL = "Todo not found"
+LIST_NOT_FOUND_DETAIL = "List not found"
 INVALID_ASSET_IDS_DETAIL = "Invalid asset IDs"
 
 
@@ -58,8 +60,34 @@ def create_todo(
     db: Session = Depends(get_db),
 ) -> Todo:
     """Create a new todo item for the authenticated user."""
+    if payload.list_id is not None:
+        stmt_list = select(TodoList).where(
+            TodoList.id == payload.list_id,
+            TodoList.user_id == user_id,
+        )
+        target_list = db.scalar(stmt_list)
+        if target_list is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=LIST_NOT_FOUND_DETAIL,
+            )
+        target_list_id = payload.list_id
+    else:
+        stmt_default = select(TodoList).where(
+            TodoList.user_id == user_id,
+            TodoList.is_default == True,  # noqa: E712
+        )
+        default_list = db.scalar(stmt_default)
+        if default_list is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Default list not found",
+            )
+        target_list_id = default_list.id
+
     todo = Todo(
         user_id=user_id,
+        list_id=target_list_id,
         title=payload.title,
         description=payload.description,
         due_date=payload.due_date,
@@ -81,6 +109,7 @@ def create_todo(
 @router.get("", response_model=list[TodoRead], status_code=status.HTTP_200_OK)
 @router.get("/", response_model=list[TodoRead], status_code=status.HTTP_200_OK, include_in_schema=False)
 def list_todos(
+    list_id: uuid.UUID | None = None,
     user_id: uuid.UUID = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> Sequence[Todo]:
@@ -89,18 +118,21 @@ def list_todos(
         select(Todo)
         .where(Todo.user_id == user_id)
         .options(selectinload(Todo.assets))
-        .order_by(
-            case(
-                (Todo.is_completed, 2),
-                (Todo.due_date.is_(None), 1),
-                else_=0,
-            ).asc(),
-            case(
-                (~Todo.is_completed, Todo.due_date),
-                else_=None,
-            ).asc(),
-            Todo.created_at.asc(),
-        )
+    )
+    if list_id is not None:
+        stmt = stmt.where(Todo.list_id == list_id)
+
+    stmt = stmt.order_by(
+        case(
+            (Todo.is_completed, 2),
+            (Todo.due_date.is_(None), 1),
+            else_=0,
+        ).asc(),
+        case(
+            (~Todo.is_completed, Todo.due_date),
+            else_=None,
+        ).asc(),
+        Todo.created_at.asc(),
     )
     return db.scalars(stmt).all()
 
@@ -147,6 +179,25 @@ def update_todo(
         )
 
     update_data = payload.model_dump(exclude_unset=True)
+    if "list_id" in update_data:
+        new_list_id = update_data.pop("list_id")
+        if new_list_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="List ID cannot be null",
+            )
+        stmt_list = select(TodoList).where(
+            TodoList.id == new_list_id,
+            TodoList.user_id == user_id,
+        )
+        target_list = db.scalar(stmt_list)
+        if target_list is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=LIST_NOT_FOUND_DETAIL,
+            )
+        todo.list_id = new_list_id
+
     if "asset_ids" in update_data:
         asset_ids = update_data.pop("asset_ids")
         if asset_ids:

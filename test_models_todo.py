@@ -60,6 +60,18 @@ def test_user_id_references_the_users_table():
     assert foreign_key.ondelete == "CASCADE"
 
 
+def test_list_id_references_the_todo_lists_table():
+    column = Todo.__table__.c.list_id
+
+    assert column.nullable is False
+    assert column.index is True
+    assert isinstance(column.type, sa.Uuid)
+
+    foreign_key, = column.foreign_keys
+    assert foreign_key.column is Base.metadata.tables["todo_lists"].c.id
+    assert foreign_key.ondelete == "CASCADE"
+
+
 def test_title_is_required():
     column = Todo.__table__.c.title
 
@@ -129,3 +141,18 @@ def test_todo_can_be_instantiated_with_due_date():
     assert todo.title == "Test task"
     assert todo.description == "Test details"
     assert todo.due_date == due
+
+
+def test_todo_can_be_instantiated_with_list_id():
+    user_id = uuid.uuid4()
+    list_id = uuid.uuid4()
+
+    todo = Todo(
+        user_id=user_id,
+        list_id=list_id,
+        title="Test task",
+    )
+
+    assert todo.user_id == user_id
+    assert todo.list_id == list_id
+    assert todo.title == "Test task"
