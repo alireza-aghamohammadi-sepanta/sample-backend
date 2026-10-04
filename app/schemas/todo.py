@@ -23,6 +23,7 @@ class TodoBase(BaseModel):
 class TodoCreate(TodoBase):
     """Payload for creating a new todo item."""
 
+    list_id: uuid.UUID | None = None
     due_date: datetime | None = None
     asset_ids: list[uuid.UUID] | None = Field(
         default=None,
@@ -42,6 +43,7 @@ class TodoCreate(TodoBase):
 class TodoUpdate(BaseModel):
     """Payload for updating an existing todo item."""
 
+    list_id: uuid.UUID | None = None
     title: str | None = Field(default=None, min_length=1, max_length=MAX_TITLE_LENGTH)
     description: str | None = Field(default=None, max_length=MAX_DESCRIPTION_LENGTH)
     due_date: datetime | None = None
@@ -68,6 +70,7 @@ class TodoRead(TodoBase):
 
     id: uuid.UUID
     user_id: uuid.UUID
+    list_id: uuid.UUID
     is_completed: bool
     due_date: datetime | None = None
     created_at: datetime
