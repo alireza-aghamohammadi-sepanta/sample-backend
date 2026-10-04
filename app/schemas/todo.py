@@ -17,11 +17,13 @@ class TodoBase(BaseModel):
 
     title: str = Field(min_length=1, max_length=MAX_TITLE_LENGTH)
     description: str | None = Field(default=None, max_length=MAX_DESCRIPTION_LENGTH)
+    due_date: datetime | None = None
 
 
 class TodoCreate(TodoBase):
     """Payload for creating a new todo item."""
 
+    due_date: datetime | None = None
     asset_ids: list[uuid.UUID] | None = Field(
         default=None,
         max_length=MAX_ASSETS_PER_TODO,
@@ -42,6 +44,7 @@ class TodoUpdate(BaseModel):
 
     title: str | None = Field(default=None, min_length=1, max_length=MAX_TITLE_LENGTH)
     description: str | None = Field(default=None, max_length=MAX_DESCRIPTION_LENGTH)
+    due_date: datetime | None = None
     is_completed: bool | None = None
     asset_ids: list[uuid.UUID] | None = Field(
         default=None,
@@ -66,6 +69,7 @@ class TodoRead(TodoBase):
     id: uuid.UUID
     user_id: uuid.UUID
     is_completed: bool
+    due_date: datetime | None = None
     created_at: datetime
     updated_at: datetime
     assets: list[AssetResponse] = Field(default_factory=list)
