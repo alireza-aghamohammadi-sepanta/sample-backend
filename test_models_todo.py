@@ -5,6 +5,7 @@ so the suite stays runnable without a database service.
 """
 
 import uuid
+from datetime import datetime, timezone
 
 import sqlalchemy as sa
 
@@ -24,10 +25,19 @@ def test_todo_columns():
         "user_id",
         "title",
         "description",
+        "due_date",
         "is_completed",
         "created_at",
         "updated_at",
     } <= columns
+
+
+def test_due_date_is_nullable():
+    column = Todo.__table__.c.due_date
+
+    assert column.nullable is True
+    assert isinstance(column.type, sa.DateTime)
+    assert column.type.timezone is True
 
 
 def test_id_is_a_uuid_primary_key_with_a_default():
@@ -101,3 +111,21 @@ def test_todo_can_be_instantiated():
     assert todo.user_id == user_id
     assert todo.title == "Test task"
     assert todo.description == "Test details"
+    assert todo.due_date is None
+
+
+def test_todo_can_be_instantiated_with_due_date():
+    user_id = uuid.uuid4()
+    due = datetime(2026, 10, 10, 12, 0, 0, tzinfo=timezone.utc)
+
+    todo = Todo(
+        user_id=user_id,
+        title="Test task",
+        description="Test details",
+        due_date=due,
+    )
+
+    assert todo.user_id == user_id
+    assert todo.title == "Test task"
+    assert todo.description == "Test details"
+    assert todo.due_date == due

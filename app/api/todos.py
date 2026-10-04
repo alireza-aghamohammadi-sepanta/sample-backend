@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.security import current_user
@@ -62,6 +62,7 @@ def create_todo(
         user_id=user_id,
         title=payload.title,
         description=payload.description,
+        due_date=payload.due_date,
     )
     if payload.asset_ids:
         todo.assets = _validate_and_get_assets(db, payload.asset_ids, user_id)
@@ -88,7 +89,18 @@ def list_todos(
         select(Todo)
         .where(Todo.user_id == user_id)
         .options(selectinload(Todo.assets))
-        .order_by(Todo.created_at.asc())
+        .order_by(
+            case(
+                (Todo.is_completed, 2),
+                (Todo.due_date.is_(None), 1),
+                else_=0,
+            ).asc(),
+            case(
+                (~Todo.is_completed, Todo.due_date),
+                else_=None,
+            ).asc(),
+            Todo.created_at.asc(),
+        )
     )
     return db.scalars(stmt).all()
 

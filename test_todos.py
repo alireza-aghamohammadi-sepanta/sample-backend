@@ -6,7 +6,7 @@ runs without external services.
 """
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import sqlalchemy as sa
@@ -188,7 +188,47 @@ def test_create_todo_title_only(client, auth_headers, user_id, db_session):
     assert data["title"] == "Call dentist"
     assert data["description"] is None
     assert data["is_completed"] is False
+    assert data["due_date"] is None
     assert data["user_id"] == str(user_id)
+
+
+def test_create_todo_with_due_date(client, auth_headers, user_id, db_session):
+    """Creating a todo with due_date sets and persists the field."""
+    due = datetime(2026, 10, 15, 12, 0, 0, tzinfo=timezone.utc)
+    payload = {
+        "title": "Complete assignment",
+        "description": "Due soon",
+        "due_date": due.isoformat(),
+    }
+    response = client.post("/todos", json=payload, headers=auth_headers)
+
+    assert response.status_code == 201
+    data = response.json()
+    assert data["title"] == "Complete assignment"
+    assert data["due_date"] is not None
+    dt = datetime.fromisoformat(data["due_date"])
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    assert dt == due
+
+    persisted = db_session.get(Todo, uuid.UUID(data["id"]))
+    assert persisted is not None
+    assert persisted.due_date is not None
+
+
+def test_create_todo_without_due_date(client, auth_headers, user_id, db_session):
+    """Creating a todo without due_date leaves due_date as None."""
+    payload = {
+        "title": "Task without deadline",
+    }
+    response = client.post("/todos", json=payload, headers=auth_headers)
+
+    assert response.status_code == 201
+    data = response.json()
+    assert data["due_date"] is None
+
+    persisted = db_session.get(Todo, uuid.UUID(data["id"]))
+    assert persisted.due_date is None
 
 
 def test_create_todo_unauthenticated(client):
@@ -399,6 +439,88 @@ def test_list_todos_returns_user_todos(client, auth_headers, user_id, db_session
     assert "Second todo" in titles
     for item in data:
         assert item["user_id"] == str(user_id)
+
+
+def test_list_todos_ordering(client, auth_headers, user_id, db_session):
+    """Listing todos returns active tasks sorted by nearest due_date ASC,
+    then active undated by created_at ASC, followed by completed tasks chronologically.
+    """
+    base_time = datetime(2026, 10, 1, 10, 0, 0, tzinfo=timezone.utc)
+    due_earlier = datetime(2026, 10, 10, 12, 0, 0, tzinfo=timezone.utc)
+    due_later = datetime(2026, 10, 20, 12, 0, 0, tzinfo=timezone.utc)
+    due_completed = datetime(2026, 10, 5, 12, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Active task with later due date, created first
+    todo_active_later = Todo(
+        user_id=user_id,
+        title="Active Later Due",
+        due_date=due_later,
+        created_at=base_time,
+        is_completed=False,
+    )
+    # 2. Active task with earlier due date, created second
+    todo_active_earlier = Todo(
+        user_id=user_id,
+        title="Active Earlier Due",
+        due_date=due_earlier,
+        created_at=base_time + timedelta(hours=1),
+        is_completed=False,
+    )
+    # 3. Active task without due date, created third
+    todo_active_no_due_1 = Todo(
+        user_id=user_id,
+        title="Active No Due 1",
+        due_date=None,
+        created_at=base_time + timedelta(hours=2),
+        is_completed=False,
+    )
+    # 4. Active task without due date, created fourth
+    todo_active_no_due_2 = Todo(
+        user_id=user_id,
+        title="Active No Due 2",
+        due_date=None,
+        created_at=base_time + timedelta(hours=3),
+        is_completed=False,
+    )
+    # 5. Completed task with an early due date, created fifth
+    todo_completed_1 = Todo(
+        user_id=user_id,
+        title="Completed 1",
+        due_date=due_completed,
+        created_at=base_time + timedelta(hours=4),
+        is_completed=True,
+    )
+    # 6. Completed task without due date, created sixth
+    todo_completed_2 = Todo(
+        user_id=user_id,
+        title="Completed 2",
+        due_date=None,
+        created_at=base_time + timedelta(hours=5),
+        is_completed=True,
+    )
+
+    db_session.add_all([
+        todo_completed_2,
+        todo_active_no_due_2,
+        todo_active_later,
+        todo_completed_1,
+        todo_active_earlier,
+        todo_active_no_due_1,
+    ])
+    db_session.commit()
+
+    response = client.get("/todos", headers=auth_headers)
+    assert response.status_code == 200
+    data = response.json()
+    titles = [item["title"] for item in data]
+    assert titles == [
+        "Active Earlier Due",
+        "Active Later Due",
+        "Active No Due 1",
+        "Active No Due 2",
+        "Completed 1",
+        "Completed 2",
+    ]
 
 
 def test_list_todos_scoped_to_current_user(
@@ -660,6 +782,52 @@ def test_patch_todo_description(client, auth_headers, user_id, db_session):
     )
     assert clear_response.status_code == 200
     assert clear_response.json()["description"] is None
+
+
+def test_patch_todo_due_date(client, auth_headers, user_id, db_session):
+    """Partially updating due_date updates and clears the field without affecting other fields."""
+    todo = Todo(
+        user_id=user_id,
+        title="Due task",
+        description="Task notes",
+        is_completed=False,
+    )
+    db_session.add(todo)
+    db_session.commit()
+
+    due = datetime(2026, 10, 20, 15, 30, 0, tzinfo=timezone.utc)
+    # Update due_date
+    response = client.patch(
+        f"/todos/{todo.id}",
+        json={"due_date": due.isoformat()},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["title"] == "Due task"
+    assert data["description"] == "Task notes"
+    assert data["due_date"] is not None
+    dt = datetime.fromisoformat(data["due_date"])
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    assert dt == due
+
+    db_session.refresh(todo)
+    assert todo.due_date is not None
+
+    # Clear due_date
+    clear_response = client.patch(
+        f"/todos/{todo.id}",
+        json={"due_date": None},
+        headers=auth_headers,
+    )
+    assert clear_response.status_code == 200
+    assert clear_response.json()["due_date"] is None
+
+    db_session.refresh(todo)
+    assert todo.due_date is None
+    assert todo.title == "Due task"
+    assert todo.description == "Task notes"
 
 
 
