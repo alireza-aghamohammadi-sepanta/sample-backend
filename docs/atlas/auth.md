@@ -2,7 +2,7 @@
 type: concept
 title: User Accounts and Authentication
 summary: User registration, login, password recovery flows, and account data models.
-related: ["security.md", "database.md", "email.md"]
+related: ["security.md", "database.md", "email.md", "lists.md"]
 source_paths:
   - "app/api/auth.py"
   - "app/models/user.py"
@@ -48,7 +48,7 @@ Both `UserCreate`, `UserLogin`, and `ForgotPasswordRequest` provide a `normalize
 ### 1. Registration (`POST /signup`)
 - Checks if the normalized email is already registered. If found, returns HTTP 409 Conflict (`Email already registered`).
 - Hashes password using Argon2 via [security](security.md).
-- Persists new `User` record to PostgreSQL via [database](database.md).
+- Persists new `User` record to PostgreSQL via [database](database.md) and provisions a default "Inbox" [todo list](lists.md) (`is_default=True`).
 - Safely catches database unique constraint race conditions (`IntegrityError`) and translates them to HTTP 409 without leaking internal database error messages.
 - Returns a signed bearer token (`Token`).
 

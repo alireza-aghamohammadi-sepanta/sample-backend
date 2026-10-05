@@ -2,7 +2,7 @@
 type: concept
 title: Database Schema and Migrations
 summary: Alembic migration setup, offline and online execution modes, and database schema revision history.
-related: ["database.md", "auth.md", "todos.md", "assets.md"]
+related: ["database.md", "auth.md", "todos.md", "assets.md", "lists.md"]
 source_paths:
   - "alembic.ini"
   - "alembic/env.py"
@@ -11,6 +11,8 @@ source_paths:
   - "migrations/versions/003_add_todos_table.py"
   - "migrations/versions/004_add_assets_table.py"
   - "migrations/versions/005_add_todo_assets_table.py"
+  - "migrations/versions/006_add_due_date_to_todos.py"
+  - "migrations/versions/007_add_todo_lists_table.py"
 ---
 
 # Database Schema and Migrations
@@ -48,6 +50,12 @@ The database schema has evolved through sequential revisions:
        │
        ▼
   005 (add todo_assets table)
+       │
+       ▼
+  006 (add due date to todos)
+       │
+       ▼
+  007 (add todo lists table)
 ```
 
 ### Revision Details
@@ -101,3 +109,27 @@ The database schema has evolved through sequential revisions:
   - `todo_id`: `sa.Uuid()`, Foreign Key referencing `todos.id` with `ondelete="CASCADE"`, part of composite Primary Key.
   - `asset_id`: `sa.Uuid()`, Foreign Key referencing `assets.id` with `ondelete="CASCADE"`, part of composite Primary Key.
 - Serves as the many-to-many junction table associating media assets with todo items.
+
+#### 6. `006_add_due_date_to_todos.py` (`006`)
+- **Table Alteration**: `todos`
+- **Columns Added**:
+  - `due_date`: `sa.DateTime(timezone=True)`, nullable.
+- Adds scheduling and deadline tracking support to tasks in [todos](todos.md).
+
+#### 7. `007_add_todo_lists_table.py` (`007`)
+- **Table**: `todo_lists`
+- **Columns**:
+  - `id`: `sa.Uuid()`, Primary Key.
+  - `user_id`: `sa.Uuid()`, Foreign Key referencing `users.id` with `ondelete="CASCADE"`, indexed `ix_todo_lists_user_id`.
+  - `name`: `sa.String(255)`, non-nullable.
+  - `is_default`: `sa.Boolean()`, server default `false`, non-nullable.
+  - `created_at`: `sa.DateTime(timezone=True)`, server default `now()`.
+  - `updated_at`: `sa.DateTime(timezone=True)`, server default `now()`.
+- **Constraint / Index**:
+  - Expression index `uq_todo_lists_user_id_lower_name` enforcing unique lowercase list names per user.
+- **Table Alteration**: `todos`
+  - Adds `list_id`: `sa.Uuid()`, Foreign Key referencing `todo_lists.id` with `ondelete="CASCADE"`, indexed `ix_todos_list_id`, non-nullable.
+- **Data Backfill**:
+  - Provisions a default "Inbox" list (`is_default=True`) for all existing users.
+  - Backfills existing `todos.list_id` to each user's default inbox list before marking the column non-nullable.
+- Implements list grouping in [todo lists](lists.md).

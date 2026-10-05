@@ -2,7 +2,7 @@
 type: concept
 title: Application Architecture & Lifecycle
 summary: FastAPI application setup, lifespan management, and shared dependency injection via app state.
-related: ["config.md", "database.md", "storage.md", "email.md", "auth.md", "todos.md", "assets.md", "deployment.md"]
+related: ["config.md", "database.md", "storage.md", "email.md", "auth.md", "lists.md", "todos.md", "assets.md", "deployment.md"]
 source_paths: ["main.py"]
 ---
 
@@ -46,9 +46,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 ## Router Registration
 
-The application mounts three feature routers under the top-level FastAPI instance:
+The application mounts four feature routers under the top-level FastAPI instance:
 - `app.include_router(auth.router)`: [Authentication](auth.md) endpoints for user registration, login, and password resets.
 - `app.include_router(assets.router)`: [Asset management](assets.md) endpoints for signed URL generation and upload confirmation.
+- `app.include_router(lists.router)`: [Todo list management](lists.md) endpoints for creating, listing, renaming, and deleting todo lists.
 - `app.include_router(todos.router)`: [Todo management](todos.md) endpoints for creating, listing, updating, and deleting todo items.
 
 ## Health Checks and Base Endpoints
@@ -67,7 +68,7 @@ The application mounts three feature routers under the top-level FastAPI instanc
                                v
 +-------------------------------------------------------------+
 |                      FastAPI Routers                        |
-|        (app/api/auth.py, app/api/assets.py, app/api/todos.py)       |
+| (app/api/auth.py, app/api/assets.py, lists.py, todos.py)   |
 +-------------------------------------------------------------+
           |                            |                |
           v                            v                v

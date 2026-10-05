@@ -1,8 +1,8 @@
 ---
 type: concept
 title: Todo Management
-summary: Task CRUD operations, user-scoped queries, and media asset associations.
-related: ["assets.md", "security.md", "database.md"]
+summary: Task CRUD operations, user-scoped queries, list assignment, due dates, and media asset associations.
+related: ["assets.md", "lists.md", "security.md", "database.md"]
 source_paths:
   - "app/api/todos.py"
   - "app/models/todo.py"
@@ -11,7 +11,7 @@ source_paths:
 
 # Todo Management
 
-The todo management subsystem provides full CRUD operations for tasks, strictly scoped to the authenticated user. It supports associating multiple media [assets](assets.md) with each task through a many-to-many relationship.
+The todo management subsystem provides full CRUD operations for tasks, strictly scoped to the authenticated user. Tasks are organized within user-scoped [todo lists](lists.md), optionally track a `due_date`, and support associating multiple media [assets](assets.md) through a many-to-many relationship.
 
 ## Data Models
 
@@ -19,9 +19,11 @@ The todo management subsystem provides full CRUD operations for tasks, strictly 
 Represents an individual task in the `todos` table:
 - `id`: UUID primary key.
 - `user_id`: UUID foreign key to `users.id` with cascade deletion, indexed.
+- `list_id`: UUID foreign key to `todo_lists.id` with cascade deletion, indexed.
 - `title`: `String(255)`, non-nullable.
 - `description`: `String(1024)`, optional.
 - `is_completed`: `Boolean`, default `False`.
+- `due_date`: UTC timestamp (`DateTime(timezone=True)`), optional.
 - `created_at`: UTC timestamp.
 - `updated_at`: UTC timestamp, automatically refreshed on modification.
 - `assets`: Relationship to `Asset` models via the `todo_assets` association table.
@@ -34,10 +36,10 @@ A secondary table managing the many-to-many association:
 
 ## Schemas (`app/schemas/todo.py`)
 
-- **`TodoBase`**: Core fields `title` (1–255 chars) and optional `description` (up to 1024 chars).
-- **`TodoCreate`**: Extends `TodoBase` with an optional `asset_ids` list (maximum 10 assets per todo). A validator deduplicates asset IDs while preserving order.
-- **`TodoUpdate`**: Partial update schema with optional `title`, `description`, `is_completed`, and `asset_ids` (maximum 10, deduplicated).
-- **`TodoRead`**: Serialization model including `id`, `user_id`, `is_completed`, `created_at`, `updated_at`, and nested `assets: list[AssetResponse]`.
+- **`TodoBase`**: Core fields `title` (1–255 chars), optional `description` (up to 1024 chars), and optional `due_date`.
+- **`TodoCreate`**: Extends `TodoBase` with optional `list_id` and an optional `asset_ids` list (maximum 10 assets per todo). A validator deduplicates asset IDs while preserving order. If `list_id` is omitted, the task is assigned to the user's default list.
+- **`TodoUpdate`**: Partial update schema with optional `list_id` (non-nullable), `title`, `description`, `due_date`, `is_completed`, and `asset_ids` (maximum 10, deduplicated).
+- **`TodoRead`**: Serialization model including `id`, `user_id`, `list_id`, `title`, `description`, `is_completed`, `due_date`, `created_at`, `updated_at`, and nested `assets: list[AssetResponse]`.
 
 ## Endpoints and Ownership Enforcement
 
@@ -53,10 +55,10 @@ Before attaching assets to a todo, `_validate_and_get_assets(db, asset_ids, user
 
 | Method | Path | Status Code | Description |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/todos` | 201 Created | Creates a new task. If `asset_ids` are supplied, validates ownership and links them. Eagerly loads assets using `selectinload(Todo.assets)` before returning. |
-| `GET` | `/todos` | 200 OK | Lists all tasks owned by the current user, ordered by `created_at ASC`, with related assets eagerly loaded. |
+| `POST` | `/todos` | 201 Created | Creates a new task. If `list_id` is specified, verifies it exists and belongs to the user (404 if not); otherwise assigns to the default list. Validates asset IDs if supplied. Eagerly loads assets using `selectinload(Todo.assets)`. |
+| `GET` | `/todos` | 200 OK | Lists tasks owned by the current user, optionally filtered by `list_id` query parameter. Sorted by status and due date: uncompleted with due date first (`due_date ASC`), uncompleted without due date, completed last, with `created_at ASC` as tiebreaker. Eagerly loads assets. |
 | `GET` | `/todos/{todo_id}` | 200 OK | Retrieves a specific task owned by the user. Returns 404 if not found or owned by someone else. |
-| `PATCH` | `/todos/{todo_id}` | 200 OK | Partially updates title, description, completion status, or attached assets. Updates `updated_at` to the current UTC timestamp. |
+| `PATCH` | `/todos/{todo_id}` | 200 OK | Partially updates title, description, due date, completion status, list assignment (`list_id`), or attached assets. Rejects `null` list IDs with 400 and unowned list IDs with 404. Updates `updated_at` to the current UTC timestamp. |
 | `DELETE` | `/todos/{todo_id}` | 204 No Content | Deletes the task. Cascade constraints automatically clean up `todo_assets` junction rows. |
 
 ## Relationship Diagram
@@ -69,18 +71,20 @@ Before attaching assets to a todo, `_validate_and_get_assets(db, asset_ids, user
 | email             |      |      | asset_id (PK, FK)     |       |     | user_id (FK)      |
 | hashed_password   |      |      +-----------------------+       |     | gcs_path          |
 +-------------------+      |                  ^                   |     | public_url        |
-         ^                 |                  |                   |     | media_type        |
-         |                 |                  v                   |     +-------------------+
-         |            +----+--------------+                       |
-         +------------|       Todo        |                       |
-                      |-------------------|                       |
-                      | id (PK)           |                       |
-                      | user_id (FK)      |                       |
-                      | title             |                       |
-                      | description       |                       |
-                      | is_completed      |                       |
-                      | assets (rel)      |-----------------------+
-                      +-------------------+
+     ^          ^          |                  |                   |     | media_type        |
+     |          |          |                  v                   |     +-------------------+
+     |   +------+----------+----+        +----+--------------+    |
+     |   |       TodoList       |        |       Todo        |    |
+     |   |----------------------|        |-------------------|    |
+     |   | id (PK)              |<-------| list_id (FK)      |    |
+     +---| user_id (FK)         |        | id (PK)           |    |
+         | name                 |        | user_id (FK)      |----+
+         | is_default           |        | title             |
+         +----------------------+        | description       |
+                                         | is_completed      |
+                                         | due_date          |
+                                         | assets (rel)      |----+
+                                         +-------------------+
 ```
 
-For media upload workflows and asset metadata storage, see [asset management](assets.md).
+For list organization rules and deletion safeguards, see [todo lists](lists.md). For media upload workflows and asset metadata storage, see [asset management](assets.md).

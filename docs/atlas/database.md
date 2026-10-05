@@ -2,7 +2,7 @@
 type: concept
 title: Database Management and Sessions
 summary: SQLAlchemy engine lifecycle, lazy Cloud SQL IAM connection pooling, and FastAPI session dependency injection.
-related: ["migrations.md", "architecture.md", "config.md", "auth.md", "todos.md"]
+related: ["migrations.md", "architecture.md", "config.md", "auth.md", "todos.md", "lists.md"]
 source_paths: ["app/db/session.py"]
 ---
 
@@ -19,7 +19,7 @@ class Base(DeclarativeBase):
     """Declarative base class shared by all ORM models."""
 ```
 
-Models registered under `Base` include `User`, `PasswordResetToken`, `Todo`, and `Asset`.
+Models registered under `Base` include `User`, `PasswordResetToken`, `Todo`, `TodoList`, and `Asset`.
 
 ## `DatabaseManager` Architecture
 
